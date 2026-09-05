@@ -143,13 +143,6 @@ public final class JournalScrape {
         if (!c.equals(COMMAND) && !c.startsWith(COMMAND + " ")) {
             return false;
         }
-        // A running walk can be called off - useful when it is sitting out a disconnect you do not
-        // intend to come back from. What it has collected is written, not discarded.
-        if (state != State.IDLE && (c.endsWith(" stop") || c.endsWith(" cancel"))) {
-            say(Component.literal("cancelled").withStyle(ChatFormatting.YELLOW));
-            finish(Minecraft.getInstance());
-            return true;
-        }
         // The reopen re-sends this command and it comes back through here; without this guard the
         // walk re-arms on every entry and discards what it has already collected.
         if (state != State.IDLE) {

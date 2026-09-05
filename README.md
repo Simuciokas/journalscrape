@@ -9,9 +9,11 @@ result. `/journal 5` scrapes only the first five entries.
 
 **It survives a kick.** If the connection drops mid-walk - including because the server kicked you
 for the very commands this mod sends - the run is not lost: progress is written out immediately,
-the walk parks, and it resumes at the entry it was on once you are back in the world. The output
+the walk parks, and it resumes at the entry it was on once you are back in the world. There is
+no cancel command: the GUI is open for the whole run, so there would never be a moment to type
+one - disconnect or close the game if you need a run to stop. The output
 records `disconnects` and a `complete` flag, and partial results are saved every 10 entries anyway,
-so even a crash leaves a usable file. `/journal stop` calls a run off and writes what it has.
+so even a crash leaves a usable file.
 
 **It paces itself on purpose.** Reading an entry closes the grid, so the walk re-issues `/journal`
 once per entry - and a hundred-odd commands as fast as the client can send them reads as command
