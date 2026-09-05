@@ -73,15 +73,11 @@ public final class JournalScrape {
     private static final int PREV_SLOT = 46;           // "Previous" (46 and 47 are duplicates)
     private static final int NEXT_SLOT = 51;           // "Next" (51 and 52 are duplicates)
 
-    /**
-     * Minimum ticks between two {@code /journal} sends. The walk needs the command once per entry
-     * to get the grid back, and a hundred-odd commands in quick succession is exactly what server
-     * anti-spam kicks for - not a theoretical risk, it happened. This is the one place the scrape
-     * is deliberately slow, and it cannot be set to zero.
-     */
-    private static final int DEFAULT_COMMAND_COOLDOWN = 40;
-    private static final int MIN_COMMAND_COOLDOWN = 10;
-
+    // NO THROTTLE ON THE REOPEN COMMAND, deliberately. The walk sends /journal once per entry, as
+    // fast as the state machine can go, which a server may well treat as command spam - it has
+    // kicked for it before. That is accepted rather than prevented: a disconnect no longer loses
+    // the run, it parks the walk and resumes at the entry it was on. Speed is preferred to the
+    // pause, on the bet that rejoining is quicker than pacing every reopen.
     private static final int TIMEOUT = 60;             // waiting for a server-pushed screen
     private static final int SHORT_TIMEOUT = 12;       // "did anything change?" probe
     private static final int MAX_PAGE_STEPS = 40;      // a book this long means something is wrong
@@ -107,8 +103,6 @@ public final class JournalScrape {
     /** Ticks to let a fresh join settle before resuming - a command sent too early is wasted. */
     private static final int REJOIN_SETTLE = 60;
 
-    private static int cooldown = DEFAULT_COMMAND_COOLDOWN;
-    private static int sinceCommand;           // ticks since the last /journal went out
     private static int commandsSent;
     private static int navAt;                  // page reached while navigating back to gridPage
     private static String pageMarker = "";     // first entry's name on the current page
@@ -149,7 +143,6 @@ public final class JournalScrape {
             return false;
         }
         limit = Integer.MAX_VALUE;             // bare /journal walks the whole tab
-        cooldown = DEFAULT_COMMAND_COOLDOWN;
         final String[] parts = c.split("\\s+");
         if (parts.length > 1) {
             try {
@@ -158,19 +151,9 @@ public final class JournalScrape {
                 return false;
             }
         }
-        // A second argument tunes the anti-spam gap: /journal 40 80 walks 40 entries with 4s
-        // between reopens. Floored rather than trusted - zero would get you kicked.
-        if (parts.length > 2) {
-            try {
-                cooldown = Math.max(MIN_COMMAND_COOLDOWN, Integer.parseInt(parts[2]));
-            } catch (NumberFormatException ignored) {
-                cooldown = DEFAULT_COMMAND_COOLDOWN;
-            }
-        }
         slotIndex = 0;
         dialogPage = 0;
         steps = 0;
-        sinceCommand = 0;                      // the opening command has just gone out
         commandsSent = 1;
         gridPage = 0;
         navAt = 0;
@@ -188,8 +171,7 @@ public final class JournalScrape {
         say(Component.literal((limit == Integer.MAX_VALUE
                         ? "scraping every page of the first tab"
                         : ("scraping up to " + limit + " entries"))
-                        + " - leave the GUI alone; "
-                        + String.format("%.1fs", cooldown / 20.0) + " between reopens to avoid a spam kick")
+                        + " - leave the GUI alone; a kick will pause it, not end it")
                 .withStyle(ChatFormatting.GRAY));
         return true;
     }
@@ -198,8 +180,6 @@ public final class JournalScrape {
         if (state == State.IDLE || mc == null || mc.gui == null) {
             return;
         }
-        sinceCommand++;
-
         // A KICK IS NOT THE END OF THE WALK. Losing the connection used to abandon the run and
         // throw away everything collected; now the progress is written out and the walk parks
         // until you are back in, then picks up at the entry it was on.
@@ -327,7 +307,6 @@ public final class JournalScrape {
                 if (--wait <= 0) {
                     say(Component.literal("resuming at entry " + (entries.size() + 1))
                             .withStyle(ChatFormatting.GRAY));
-                    sinceCommand = cooldown;      // do not make the first command wait needlessly
                     pageMarker = "";              // force a re-navigation: the page is unknown now
                     steps = 0;
                     state = State.REOPEN;
@@ -339,12 +318,9 @@ public final class JournalScrape {
                 } else if (mc.getConnection() == null) {
                     state = State.WAIT_RECONNECT;   // unreachable in practice: tick() catches a
                     wait = REJOIN_SETTLE;           // dropped connection first. Defensive only.
-                } else if (sinceCommand < cooldown) {
-                    mc.setScreenAndShow(null);    // idling on purpose: see DEFAULT_COMMAND_COOLDOWN
                 } else {
                     mc.setScreenAndShow(null);
                     mc.getConnection().sendCommand(COMMAND);
-                    sinceCommand = 0;
                     commandsSent++;
                     state = State.WAIT_REGRID;
                     wait = TIMEOUT;

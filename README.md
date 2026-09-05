@@ -15,19 +15,11 @@ one - disconnect or close the game if you need a run to stop. The output
 records `disconnects` and a `complete` flag, and partial results are saved every 10 entries anyway,
 so even a crash leaves a usable file.
 
-**It paces itself on purpose.** Reading an entry closes the grid, so the walk re-issues `/journal`
-once per entry - and a hundred-odd commands as fast as the client can send them reads as command
-spam and gets you kicked. There is a 2s floor between reopens, which dominates the runtime of a
-full scrape and is the price of not being disconnected halfway through. `/journal 40 80` walks 40
-entries with 4s between reopens; the gap cannot be set below 0.5s.
-
-```
-[journal] scraping up to 32 entries - leave the GUI alone
-[journal] 32 entries -> journal-2026-09-05_23-14-02.json     <- click to open the folder
-```
-
-Output lands in `<gamedir>/journalscrape/`, one timestamped file per run, so runs never clobber
-each other. The chat link is a vanilla `open_file` click event; hovering it shows the full path.
+**No command throttle.** Reading an entry closes the grid, so the walk re-issues `/journal` once
+per entry, as fast as it can - which a server may treat as command spam. That is accepted rather
+than prevented: a kick pauses the walk instead of ending it, and rejoining is usually quicker than
+pacing every reopen would have been. If your server kicks hard enough to stall progress, the walk
+can end up in a kick/rejoin loop; the fix then is fewer entries per run (`/journal 20`).
 
 ## What it captures
 
