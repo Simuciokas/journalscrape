@@ -1,0 +1,10 @@
+build/
+.gradle/
+run/
+
+# The compile classpath is downloaded, not committed - Mojang's client jar is not redistributable.
+*.class
+
+.idea/
+*.iml
+.vscode/

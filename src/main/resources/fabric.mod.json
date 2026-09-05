@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "journalscrape",
+  "version": "${version}",
+  "name": "Journal Scrape",
+  "description": "Walks a server's /journal knowledge GUI and dumps every entry - pages, resistances, weaknesses, stat bonuses and full drop definitions - to JSON, then links the file in chat.",
+  "authors": [ "Simuciokas" ],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {},
+  "mixins": [ "journalscrape.mixins.json" ],
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": "~26.2",
+    "java": ">=25"
+  }
+}

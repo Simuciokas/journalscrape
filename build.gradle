@@ -1,0 +1,128 @@
+import groovy.json.JsonSlurper
+import java.security.MessageDigest
+
+plugins { id 'java' }
+
+version = project.mod_version
+group = project.maven_group
+
+// NO FABRIC LOOM, deliberately.
+//
+// Minecraft 26.2 has NO named mapping source at all:
+//   * yarn publishes no 26.2 build
+//   * intermediary's mappings.tiny is a 25-byte header with ZERO class entries
+//   * Mojang's 26.2 version json ships only 'client' and 'server' - no client_mappings
+// That is not an obstacle, it is the reason none is needed: the shipped jar is already in
+// readable official names, and because intermediary is an identity mapping, what we compile
+// against is exactly what runs. Loom exists to remap; with nothing to remap it only gets in
+// the way, failing at configuration time with "Failed to find official mojang mappings".
+//
+// AND NO LOCAL GAME INSTALL EITHER. The client jar and MC's own libraries are fetched from
+// Mojang's piston metadata, the same source any launcher uses, so a bare CI runner can build
+// this. Downloads are verified against the sha1 the manifest publishes and land in
+// build/minecraft/<version>/, where they are reused (and cached in CI) rather than re-fetched.
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'FabricMC'
+        url = 'https://maven.fabricmc.net/'
+    }
+}
+
+def mcVersion = project.minecraft_version
+def mcRoot = layout.buildDirectory.dir("minecraft/${mcVersion}").get().asFile
+def clientJar = new File(mcRoot, 'client.jar')
+def mcLibs = new File(mcRoot, 'libraries')
+
+def sha1 = { File f ->
+    def md = MessageDigest.getInstance('SHA-1')
+    f.withInputStream { s ->
+        byte[] buf = new byte[1 << 16]
+        int n
+        while ((n = s.read(buf)) > 0) md.update(buf, 0, n)
+    }
+    md.digest().encodeHex().toString()
+}
+
+// Download to a .part file and only then move it into place, so an interrupted build cannot
+// leave a truncated jar that looks valid to the next one.
+def fetch = { String url, File dest, String want ->
+    if (dest.isFile() && (want == null || sha1(dest) == want)) return false
+    dest.parentFile.mkdirs()
+    def part = new File(dest.parentFile, dest.name + '.part')
+    java.net.URI.create(url).toURL().withInputStream { i -> part.withOutputStream { o -> o << i } }
+    if (want != null && sha1(part) != want) {
+        part.delete()
+        throw new GradleException("sha1 mismatch downloading ${url}")
+    }
+    dest.delete()
+    if (!part.renameTo(dest)) throw new GradleException("could not move ${part} into place")
+    return true
+}
+
+def readJson = { String url ->
+    new JsonSlurper().parseText(java.net.URI.create(url).toURL().getText('UTF-8'))
+}
+
+tasks.register('downloadMinecraft') {
+    group = 'build setup'
+    description = "Fetches the ${mcVersion} client jar and its libraries from Mojang (compile-only)."
+    outputs.upToDateWhen { clientJar.isFile() && mcLibs.isDirectory() }
+    doLast {
+        def manifest = readJson('https://launchermeta.mojang.com/mc/game/version_manifest_v2.json')
+        def entry = manifest.versions.find { it.id == mcVersion }
+        if (entry == null) {
+            throw new GradleException("Mojang's manifest lists no version '${mcVersion}'")
+        }
+        def meta = readJson(entry.url)
+
+        fetch(meta.downloads.client.url, clientJar, meta.downloads.client.sha1)
+
+        // Natives are irrelevant to a compile-only classpath, and skipping them halves the
+        // download. Everything else goes in, rather than a hand-picked list: MC's own public
+        // signatures leak types from libraries this mod never references (DataFixerUpper's
+        // Codec, jspecify's @Nullable), and each omission costs a build to discover.
+        int got = 0
+        meta.libraries.each { lib ->
+            def art = lib.downloads?.artifact
+            if (art == null || art.path.contains('-natives-')) return
+            if (fetch(art.url, new File(mcLibs, art.path), art.sha1)) got++
+        }
+        logger.lifecycle("minecraft ${mcVersion}: client jar + libraries ready (${got} newly downloaded)")
+    }
+}
+
+dependencies {
+    // Compile against the real client jar. Nothing here is bundled into the mod.
+    compileOnly files(clientJar)
+    compileOnly fileTree(dir: mcLibs, include: '**/*.jar')
+
+    // Loader gives us the mod entry contract; sponge-mixin gives us @Mixin/@Inject/@Invoker.
+    // Both are provided at runtime by the Fabric installation.
+    compileOnly "net.fabricmc:fabric-loader:${project.loader_version}"
+    compileOnly "net.fabricmc:sponge-mixin:${project.mixin_version}"
+}
+
+tasks.named('compileJava') { dependsOn 'downloadMinecraft' }
+
+// 26.2's client jar is class-file major 69 = Java 25, so the mod must target 25 too - and
+// hidemodels.mixins.json declares compatibilityLevel JAVA_25 to match, without which Mixin
+// refuses to load classes this new.
+java {
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 25
+    it.options.encoding = 'UTF-8'
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') { expand 'version': project.version }
+}
+
+jar {
+    archiveBaseName = project.archives_base_name
+    manifest { attributes 'Fabric-Loom-Remap': 'false' }
+}

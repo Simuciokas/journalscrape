@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "package": "io.github.simuciokas.journalscrape.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "ClientPacketListenerMixin",
+    "DialogScreenAccessor",
+    "MinecraftMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

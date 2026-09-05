@@ -1,0 +1,7 @@
+# The Gradle wrapper script runs on the CI runner's /bin/sh: it must stay LF whatever a Windows
+# checkout does to everything else, or the shell fails on the \r. Its mode bit matters too and is
+# tracked separately (git update-index --chmod=+x gradlew).
+gradlew            text eol=lf
+*.sh               text eol=lf
+gradle-wrapper.jar binary
+*.jar              binary

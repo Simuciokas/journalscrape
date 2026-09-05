@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed only by the release step below
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # 26.2's client jar is class-file major 69, so both the toolchain and Gradle itself run on 25.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The client jar and MC's libraries are ~112 MB fetched from Mojang. They are pinned by
+      # version and sha1-verified, so caching them is safe and turns a cold minute into seconds.
+      - name: Cache Minecraft compile classpath
+        uses: actions/cache@v5
+        with:
+          path: build/minecraft
+          key: mc-${{ hashFiles('gradle.properties') }}
+
+      - run: ./gradlew build
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: journalscrape-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+      # A v* tag additionally publishes a Release with the jar attached, so there is a stable
+      # download link that does not expire the way build artifacts do.
+      #
+      # Idempotent on purpose: a tag can be pushed again (a force-update after a history rewrite,
+      # say), and a bare `gh release create` fails outright when the release already exists, which
+      # turned a re-push into a red build for no reason. Re-uploading the jar keeps the release's
+      # notes and creation date while refreshing what people download.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" build/libs/*.jar --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" build/libs/*.jar --generate-notes --title "$GITHUB_REF_NAME"
+          fi
