@@ -94,7 +94,7 @@ public final class JournalScrape {
     private enum State {
         IDLE, WAIT_GRID, CLICK_TAB, WAIT_TAB, PAGE_BACK, WAIT_PAGE_BACK,
         NAV_FORWARD, WAIT_NAV_FORWARD, OPEN_ENTRY, WAIT_DIALOG, READ_PAGE, WAIT_NEXT_PAGE,
-        NEXT_GRID_PAGE, WAIT_GRID_PAGE, REOPEN, WAIT_REGRID
+        NEXT_GRID_PAGE, WAIT_GRID_PAGE, REOPEN, WAIT_REGRID, WAIT_RECONNECT
     }
 
     private static State state = State.IDLE;
@@ -104,12 +104,18 @@ public final class JournalScrape {
     private static int steps;                  // guard against paging forever
     private static int limit;                  // max entries to capture
     private static int gridPage;               // 0-based page of the tab being walked
+    /** Ticks to let a fresh join settle before resuming - a command sent too early is wasted. */
+    private static final int REJOIN_SETTLE = 60;
+
     private static int cooldown = DEFAULT_COMMAND_COOLDOWN;
     private static int sinceCommand;           // ticks since the last /journal went out
     private static int commandsSent;
     private static int navAt;                  // page reached while navigating back to gridPage
     private static String pageMarker = "";     // first entry's name on the current page
     private static Dialog lastDialog;
+    private static String currentKey = "";     // marked as seen only once the entry is finished
+    private static Path outFile;               // fixed at the start so partial saves land in it
+    private static int kicks;
     private static JsonObject currentEntry;
     private static JsonArray entries;
     private static Set<String> seen;
@@ -136,6 +142,13 @@ public final class JournalScrape {
         final String c = command.trim().toLowerCase();
         if (!c.equals(COMMAND) && !c.startsWith(COMMAND + " ")) {
             return false;
+        }
+        // A running walk can be called off - useful when it is sitting out a disconnect you do not
+        // intend to come back from. What it has collected is written, not discarded.
+        if (state != State.IDLE && (c.endsWith(" stop") || c.endsWith(" cancel"))) {
+            say(Component.literal("cancelled").withStyle(ChatFormatting.YELLOW));
+            finish(Minecraft.getInstance());
+            return true;
         }
         // The reopen re-sends this command and it comes back through here; without this guard the
         // walk re-arms on every entry and discards what it has already collected.
@@ -171,7 +184,12 @@ public final class JournalScrape {
         pageMarker = "";
         entries = new JsonArray();
         seen = new HashSet<>();
+        kicks = 0;
+        currentKey = "";
         startedAt = System.currentTimeMillis();
+        // Chosen up front so every partial save through the run lands in the same file.
+        outFile = Minecraft.getInstance().gameDirectory.toPath().resolve(MOD_ID)
+                .resolve("journal-" + LocalDateTime.now().format(STAMP) + ".json");
         state = State.WAIT_GRID;
         wait = TIMEOUT;
         say(Component.literal((limit == Integer.MAX_VALUE
@@ -188,6 +206,24 @@ public final class JournalScrape {
             return;
         }
         sinceCommand++;
+
+        // A KICK IS NOT THE END OF THE WALK. Losing the connection used to abandon the run and
+        // throw away everything collected; now the progress is written out and the walk parks
+        // until you are back in, then picks up at the entry it was on.
+        final boolean connected = mc.getConnection() != null && mc.player != null;
+        if (!connected) {
+            if (state != State.WAIT_RECONNECT) {
+                kicks++;
+                abandonEntryInProgress();
+                save(false);
+                say(Component.literal("disconnected - " + entries.size()
+                                + " entries saved so far; will resume when you are back in")
+                        .withStyle(ChatFormatting.YELLOW));
+                state = State.WAIT_RECONNECT;
+                wait = REJOIN_SETTLE;
+            }
+            return;
+        }
         switch (state) {
             case WAIT_GRID -> {
                 if (gridOpen(mc)) {
@@ -292,11 +328,24 @@ public final class JournalScrape {
                     finish(mc);                       // no further pages in this tab
                 }
             }
+            case WAIT_RECONNECT -> {
+                // Back in the world. Let the join settle, then rejoin the walk through the normal
+                // reopen path so the command still respects the anti-spam gap.
+                if (--wait <= 0) {
+                    say(Component.literal("resuming at entry " + (entries.size() + 1))
+                            .withStyle(ChatFormatting.GRAY));
+                    sinceCommand = cooldown;      // do not make the first command wait needlessly
+                    pageMarker = "";              // force a re-navigation: the page is unknown now
+                    steps = 0;
+                    state = State.REOPEN;
+                }
+            }
             case REOPEN -> {
                 if (gridOpen(mc)) {
                     state = State.OPEN_ENTRY;
                 } else if (mc.getConnection() == null) {
-                    fail("lost the connection");
+                    state = State.WAIT_RECONNECT;   // unreachable in practice: tick() catches a
+                    wait = REJOIN_SETTLE;           // dropped connection first. Defensive only.
                 } else if (sinceCommand < cooldown) {
                     mc.setScreenAndShow(null);    // idling on purpose: see DEFAULT_COMMAND_COOLDOWN
                 } else {
@@ -401,11 +450,14 @@ public final class JournalScrape {
         }
         // Pages overlap by one entry, so the boundary entry arrives twice - and re-reading it would
         // also re-open a dialog we have already walked.
+        // Marked as seen only when the entry COMPLETES: adding it here would make a kick
+        // mid-entry skip that entry forever on resume.
         final String key = keyOf(stack);
-        if (!seen.add(key)) {
+        if (seen.contains(key)) {
             slotIndex++;
             return;
         }
+        currentKey = key;
         currentEntry = new JsonObject();
         currentEntry.addProperty("page", gridPage + 1);
         currentEntry.addProperty("slot", slot);
@@ -443,15 +495,27 @@ public final class JournalScrape {
         endEntry(mc, null);
     }
 
+    /** Drop a half-read entry so the resume retries it rather than recording it truncated. */
+    private static void abandonEntryInProgress() {
+        currentEntry = null;
+        currentKey = "";
+        lastDialog = null;
+    }
+
     private static void endEntry(Minecraft mc, String error) {
         if (currentEntry != null) {
             if (error != null) {
                 currentEntry.addProperty("error", error);
             }
             entries.add(currentEntry);
+            if (!currentKey.isEmpty()) {
+                seen.add(currentKey);
+                currentKey = "";
+            }
             currentEntry = null;
             if (entries.size() % 10 == 0) {
                 say(Component.literal(entries.size() + " entries so far...").withStyle(ChatFormatting.DARK_GRAY));
+                save(false);                  // a partial file beats losing the lot to a crash
             }
         }
         slotIndex++;
@@ -459,23 +523,35 @@ public final class JournalScrape {
         state = State.REOPEN;
     }
 
-    private static void finish(Minecraft mc) {
-        mc.setScreenAndShow(null);
+    /** Writes what has been collected so far. Called on completion, on a kick, and periodically. */
+    private static boolean save(boolean complete) {
+        if (outFile == null) {
+            return false;
+        }
         final JsonObject root = new JsonObject();
         root.addProperty("scrapedAt", LocalDateTime.now().toString());
         root.addProperty("durationMs", System.currentTimeMillis() - startedAt);
         root.addProperty("entryCount", entries.size());
         root.addProperty("gridPages", gridPage + 1);
         root.addProperty("commandsSent", commandsSent);
+        root.addProperty("disconnects", kicks);
+        root.addProperty("complete", complete);
         root.add("entries", entries);
-
-        final Path dir = mc.gameDirectory.toPath().resolve(MOD_ID);
-        final Path file = dir.resolve("journal-" + LocalDateTime.now().format(STAMP) + ".json");
         try {
-            Files.createDirectories(dir);
-            Files.writeString(file, GSON.toJson(root));
+            Files.createDirectories(outFile.getParent());
+            Files.writeString(outFile, GSON.toJson(root));
+            return true;
         } catch (IOException e) {
             say(Component.literal("could not write the scrape: " + e).withStyle(ChatFormatting.RED));
+            return false;
+        }
+    }
+
+    private static void finish(Minecraft mc) {
+        mc.setScreenAndShow(null);
+        final Path file = outFile;
+        final Path dir = file.getParent();
+        if (!save(true)) {
             state = State.IDLE;
             return;
         }
@@ -490,8 +566,10 @@ public final class JournalScrape {
                                 Component.literal(file.toAbsolutePath().toString())
                                         .append(Component.literal("\nclick to open the folder")
                                                 .withStyle(ChatFormatting.GRAY)))));
-        say(Component.literal(String.format("%d entries over %d page%s in %.1fs -> ",
-                        entries.size(), gridPage + 1, gridPage == 0 ? "" : "s", secs))
+        say(Component.literal(String.format("%d entries over %d page%s in %.1fs%s -> ",
+                        entries.size(), gridPage + 1, gridPage == 0 ? "" : "s", secs,
+                        kicks == 0 ? "" : (" (survived " + kicks + " disconnect"
+                                + (kicks == 1 ? "" : "s") + ")")))
                 .withStyle(ChatFormatting.GREEN).append(link));
         state = State.IDLE;
     }
