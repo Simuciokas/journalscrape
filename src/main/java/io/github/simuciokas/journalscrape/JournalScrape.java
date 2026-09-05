@@ -73,6 +73,15 @@ public final class JournalScrape {
     private static final int PREV_SLOT = 46;           // "Previous" (46 and 47 are duplicates)
     private static final int NEXT_SLOT = 51;           // "Next" (51 and 52 are duplicates)
 
+    /**
+     * Minimum ticks between two {@code /journal} sends. The walk needs the command once per entry
+     * to get the grid back, and a hundred-odd commands in quick succession is exactly what server
+     * anti-spam kicks for - not a theoretical risk, it happened. This is the one place the scrape
+     * is deliberately slow, and it cannot be set to zero.
+     */
+    private static final int DEFAULT_COMMAND_COOLDOWN = 40;
+    private static final int MIN_COMMAND_COOLDOWN = 10;
+
     private static final int TIMEOUT = 60;             // waiting for a server-pushed screen
     private static final int SHORT_TIMEOUT = 12;       // "did anything change?" probe
     private static final int MAX_PAGE_STEPS = 40;      // a book this long means something is wrong
@@ -95,6 +104,9 @@ public final class JournalScrape {
     private static int steps;                  // guard against paging forever
     private static int limit;                  // max entries to capture
     private static int gridPage;               // 0-based page of the tab being walked
+    private static int cooldown = DEFAULT_COMMAND_COOLDOWN;
+    private static int sinceCommand;           // ticks since the last /journal went out
+    private static int commandsSent;
     private static int navAt;                  // page reached while navigating back to gridPage
     private static String pageMarker = "";     // first entry's name on the current page
     private static Dialog lastDialog;
@@ -131,6 +143,7 @@ public final class JournalScrape {
             return false;
         }
         limit = Integer.MAX_VALUE;             // bare /journal walks the whole tab
+        cooldown = DEFAULT_COMMAND_COOLDOWN;
         final String[] parts = c.split("\\s+");
         if (parts.length > 1) {
             try {
@@ -139,9 +152,20 @@ public final class JournalScrape {
                 return false;
             }
         }
+        // A second argument tunes the anti-spam gap: /journal 40 80 walks 40 entries with 4s
+        // between reopens. Floored rather than trusted - zero would get you kicked.
+        if (parts.length > 2) {
+            try {
+                cooldown = Math.max(MIN_COMMAND_COOLDOWN, Integer.parseInt(parts[2]));
+            } catch (NumberFormatException ignored) {
+                cooldown = DEFAULT_COMMAND_COOLDOWN;
+            }
+        }
         slotIndex = 0;
         dialogPage = 0;
         steps = 0;
+        sinceCommand = 0;                      // the opening command has just gone out
+        commandsSent = 1;
         gridPage = 0;
         navAt = 0;
         pageMarker = "";
@@ -150,9 +174,11 @@ public final class JournalScrape {
         startedAt = System.currentTimeMillis();
         state = State.WAIT_GRID;
         wait = TIMEOUT;
-        say(Component.literal(limit == Integer.MAX_VALUE
-                        ? "scraping every page of the first tab - leave the GUI alone"
-                        : ("scraping up to " + limit + " entries - leave the GUI alone"))
+        say(Component.literal((limit == Integer.MAX_VALUE
+                        ? "scraping every page of the first tab"
+                        : ("scraping up to " + limit + " entries"))
+                        + " - leave the GUI alone; "
+                        + String.format("%.1fs", cooldown / 20.0) + " between reopens to avoid a spam kick")
                 .withStyle(ChatFormatting.GRAY));
         return true;
     }
@@ -161,6 +187,7 @@ public final class JournalScrape {
         if (state == State.IDLE || mc == null || mc.gui == null) {
             return;
         }
+        sinceCommand++;
         switch (state) {
             case WAIT_GRID -> {
                 if (gridOpen(mc)) {
@@ -268,13 +295,17 @@ public final class JournalScrape {
             case REOPEN -> {
                 if (gridOpen(mc)) {
                     state = State.OPEN_ENTRY;
-                } else if (mc.getConnection() != null) {
+                } else if (mc.getConnection() == null) {
+                    fail("lost the connection");
+                } else if (sinceCommand < cooldown) {
+                    mc.setScreenAndShow(null);    // idling on purpose: see DEFAULT_COMMAND_COOLDOWN
+                } else {
                     mc.setScreenAndShow(null);
                     mc.getConnection().sendCommand(COMMAND);
+                    sinceCommand = 0;
+                    commandsSent++;
                     state = State.WAIT_REGRID;
                     wait = TIMEOUT;
-                } else {
-                    fail("lost the connection");
                 }
             }
             case WAIT_REGRID -> {
@@ -435,6 +466,7 @@ public final class JournalScrape {
         root.addProperty("durationMs", System.currentTimeMillis() - startedAt);
         root.addProperty("entryCount", entries.size());
         root.addProperty("gridPages", gridPage + 1);
+        root.addProperty("commandsSent", commandsSent);
         root.add("entries", entries);
 
         final Path dir = mc.gameDirectory.toPath().resolve(MOD_ID);

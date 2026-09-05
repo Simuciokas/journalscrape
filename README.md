@@ -7,6 +7,12 @@ Run `/journal` and it takes over: it normalises to the first tab and first page,
 entry, reads every page of the dialog that opens, pages through the whole tab, and writes the
 result. `/journal 5` scrapes only the first five entries.
 
+**It paces itself on purpose.** Reading an entry closes the grid, so the walk re-issues `/journal`
+once per entry - and a hundred-odd commands as fast as the client can send them reads as command
+spam and gets you kicked. There is a 2s floor between reopens, which dominates the runtime of a
+full scrape and is the price of not being disconnected halfway through. `/journal 40 80` walks 40
+entries with 4s between reopens; the gap cannot be set below 0.5s.
+
 ```
 [journal] scraping up to 32 entries - leave the GUI alone
 [journal] 32 entries -> journal-2026-09-05_23-14-02.json     <- click to open the folder
