@@ -18,8 +18,9 @@ so even a crash leaves a usable file.
 **No command throttle.** Reading an entry closes the grid, so the walk re-issues `/journal` once
 per entry, as fast as it can - which a server may treat as command spam. That is accepted rather
 than prevented: a kick pauses the walk instead of ending it, and rejoining is usually quicker than
-pacing every reopen would have been. If your server kicks hard enough to stall progress, the walk
-can end up in a kick/rejoin loop; the fix then is fewer entries per run (`/journal 20`).
+pacing every reopen would have been. Reopening the journal returns you to the page you
+were on, so a resume normally continues straight from the entry it was interrupted at, without
+re-navigating.
 
 ## What it captures
 

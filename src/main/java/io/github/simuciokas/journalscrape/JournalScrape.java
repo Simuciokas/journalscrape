@@ -307,7 +307,11 @@ public final class JournalScrape {
                 if (--wait <= 0) {
                     say(Component.literal("resuming at entry " + (entries.size() + 1))
                             .withStyle(ChatFormatting.GRAY));
-                    pageMarker = "";              // force a re-navigation: the page is unknown now
+                    // The page fingerprint is KEPT on purpose. Reopening the journal returns you to
+                    // the page you were on, so the reopen check below usually matches and the walk
+                    // carries straight on; clearing it here forced a needless re-navigation to tab
+                    // 0 and page 1 after every kick. The mismatch path is still there if the server
+                    // does put us somewhere else.
                     steps = 0;
                     state = State.REOPEN;
                 }
