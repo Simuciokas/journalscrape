@@ -3,7 +3,9 @@ package io.github.simuciokas.journalscrape;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import io.github.simuciokas.journalscrape.mixin.DialogScreenAccessor;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -12,7 +14,9 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
@@ -123,6 +127,11 @@ public final class JournalScrape {
     private static Dialog lastDialog;
     private static String currentKey = "";     // marked as seen only once the entry is finished
     private static Path outFile;               // fixed at the start so partial saves land in it
+    /** Everything ever scraped, keyed by tab|name|level, carried between runs. */
+    private static Map<String, JsonObject> library = new LinkedHashMap<>();
+    private static boolean force;              // rescrape even where the tier is unchanged
+    private static int reused;
+    private static int refreshed;
     private static int kicks;
     private static JsonObject currentEntry;
     private static JsonArray entries;
@@ -156,13 +165,18 @@ public final class JournalScrape {
         if (state != State.IDLE) {
             return false;
         }
-        limit = Integer.MAX_VALUE;             // bare /journal walks the whole tab
+        limit = Integer.MAX_VALUE;             // bare /journal walks every tab
+        force = false;
         final String[] parts = c.split("\\s+");
         if (parts.length > 1) {
-            try {
-                limit = Math.max(1, Integer.parseInt(parts[1]));
-            } catch (NumberFormatException ignored) {
-                return false;
+            if (parts[1].equals("force") || parts[1].equals("all")) {
+                force = true;
+            } else {
+                try {
+                    limit = Math.max(1, Integer.parseInt(parts[1]));
+                } catch (NumberFormatException ignored) {
+                    return false;
+                }
             }
         }
         slotIndex = 0;
@@ -178,7 +192,10 @@ public final class JournalScrape {
         entries = new JsonArray();
         seen = new HashSet<>();
         kicks = 0;
+        reused = 0;
+        refreshed = 0;
         currentKey = "";
+        loadLibrary();
         startedAt = System.currentTimeMillis();
         // Chosen up front so every partial save through the run lands in the same file.
         outFile = Minecraft.getInstance().gameDirectory.toPath().resolve(MOD_ID)
@@ -459,19 +476,52 @@ public final class JournalScrape {
 
     /** Entries are keyed by name AND level: the same name legitimately exists at two levels. */
     private static String keyOf(ItemStack stack) {
-        final String name = plain(stack.getHoverName());
-        String level = "";
+        return currentTabName() + "|" + plain(stack.getHoverName()) + "|" + levelOf(stack);
+    }
+
+    private static String levelOf(ItemStack stack) {
+        for (String t : loreOf(stack)) {
+            if (t.startsWith("Enemy Level:")) {
+                return t.substring("Enemy Level:".length()).trim();
+            }
+        }
+        return "";
+    }
+
+    private static List<String> loreOf(ItemStack stack) {
+        final List<String> out = new ArrayList<>();
         final ItemLore lore = stack.get(DataComponents.LORE);
         if (lore != null) {
             for (Component line : lore.lines()) {
-                final String t = plain(line);
-                if (t.startsWith("Enemy Level:")) {
-                    level = t.substring("Enemy Level:".length()).trim();
-                    break;
-                }
+                out.add(plain(line));
             }
         }
-        return name + "|" + level;
+        return out;
+    }
+
+    /**
+     * The unlock TIER, as shown in the container: "[ 148 / 1,000 ]" or "[ Complete! ]".
+     *
+     * <p>Deliberately the DENOMINATOR rather than the progress. The numerator moves with every kill
+     * without unlocking anything, so keying on it would re-read entries that cannot have changed;
+     * the denominator is the next threshold and only moves when a tier is actually crossed, which
+     * is exactly when the dialog gains content.
+     */
+    private static String tierOf(ItemStack stack) {
+        for (String t : loreOf(stack)) {
+            if (!t.startsWith("[") || !t.endsWith("]")) {
+                continue;
+            }
+            final String inner = t.substring(1, t.length() - 1).trim();
+            if (inner.toLowerCase().startsWith("complete")) {
+                return "complete";
+            }
+            final int slash = inner.indexOf('/');
+            if (slash >= 0) {
+                return inner.substring(slash + 1).replace(",", "").trim();
+            }
+        }
+        return "";                            // no progress line: treat as always worth reading
     }
 
     private static void openEntry(Minecraft mc) {
@@ -503,8 +553,22 @@ public final class JournalScrape {
             slotIndex++;
             return;
         }
+        // NOTHING NEW TO READ? Copy the previous run's pages forward and move on without opening
+        // the entry at all - no dialog, and no reopen command afterwards.
+        final String tier = tierOf(stack);
+        final JsonObject known = library.get(key);
+        if (!force && known != null && !tier.isEmpty()
+                && tier.equals(known.has("tier") ? known.get("tier").getAsString() : null)) {
+            entries.add(known);
+            seen.add(key);
+            reused++;
+            slotIndex++;
+            return;
+        }
         currentKey = key;
         currentEntry = new JsonObject();
+        currentEntry.addProperty("key", key);
+        currentEntry.addProperty("tier", tier);
         currentEntry.addProperty("tab", currentTabName());
         currentEntry.addProperty("page", gridPage + 1);
         currentEntry.addProperty("slot", slot);
@@ -555,7 +619,9 @@ public final class JournalScrape {
                 currentEntry.addProperty("error", error);
             }
             entries.add(currentEntry);
+            refreshed++;
             if (!currentKey.isEmpty()) {
+                library.put(currentKey, currentEntry);
                 seen.add(currentKey);
                 currentKey = "";
             }
@@ -570,23 +636,79 @@ public final class JournalScrape {
         state = State.REOPEN;
     }
 
+    private static Path libraryFile() {
+        return Minecraft.getInstance().gameDirectory.toPath().resolve(MOD_ID).resolve("journal-library.json");
+    }
+
+    /**
+     * Loads what previous runs collected. Entries whose unlock tier has not moved are copied
+     * forward instead of being re-read, which is the whole point: an entry that is skipped costs
+     * no dialog round trips and no reopen command, so a run with nothing new is quick and quiet.
+     */
+    private static void loadLibrary() {
+        library = new LinkedHashMap<>();
+        final Path f = libraryFile();
+        if (!Files.isRegularFile(f)) {
+            return;
+        }
+        try {
+            final JsonObject root = JsonParser.parseString(Files.readString(f)).getAsJsonObject();
+            final JsonArray old = root.getAsJsonArray("entries");
+            if (old == null) {
+                return;
+            }
+            for (JsonElement el : old) {
+                final JsonObject e = el.getAsJsonObject();
+                if (e.has("key")) {
+                    library.put(e.get("key").getAsString(), e);
+                }
+            }
+            say(Component.literal("library: " + library.size() + " entries from previous runs")
+                    .withStyle(ChatFormatting.DARK_GRAY));
+        } catch (Exception e) {
+            say(Component.literal("could not read the library, starting fresh: " + e)
+                    .withStyle(ChatFormatting.YELLOW));
+            library = new LinkedHashMap<>();
+        }
+    }
+
     /** Writes what has been collected so far. Called on completion, on a kick, and periodically. */
     private static boolean save(boolean complete) {
         if (outFile == null) {
             return false;
         }
+        // Entries this run has not reached are kept: the library is everything ever scraped, not a
+        // snapshot of one walk.
+        final JsonArray all = new JsonArray();
+        final Set<String> written = new HashSet<>();
+        for (JsonElement el : entries) {
+            final JsonObject e = el.getAsJsonObject();
+            if (e.has("key")) {
+                written.add(e.get("key").getAsString());
+            }
+            all.add(e);
+        }
+        for (Map.Entry<String, JsonObject> kv : library.entrySet()) {
+            if (!written.contains(kv.getKey())) {
+                all.add(kv.getValue());
+            }
+        }
         final JsonObject root = new JsonObject();
         root.addProperty("scrapedAt", LocalDateTime.now().toString());
         root.addProperty("durationMs", System.currentTimeMillis() - startedAt);
-        root.addProperty("entryCount", entries.size());
+        root.addProperty("entryCount", all.size());
+        root.addProperty("thisRun", entries.size());
+        root.addProperty("refreshed", refreshed);
+        root.addProperty("reusedFromLibrary", reused);
         root.addProperty("tabsWalked", Math.min(tabIndex + 1, Math.max(tabs.length, 1)));
         root.addProperty("commandsSent", commandsSent);
         root.addProperty("disconnects", kicks);
         root.addProperty("complete", complete);
-        root.add("entries", entries);
+        root.add("entries", all);
         try {
             Files.createDirectories(outFile.getParent());
             Files.writeString(outFile, GSON.toJson(root));
+            Files.writeString(libraryFile(), GSON.toJson(root));
             return true;
         } catch (IOException e) {
             say(Component.literal("could not write the scrape: " + e).withStyle(ChatFormatting.RED));
@@ -613,8 +735,8 @@ public final class JournalScrape {
                                 Component.literal(file.toAbsolutePath().toString())
                                         .append(Component.literal("\nclick to open the folder")
                                                 .withStyle(ChatFormatting.GRAY)))));
-        say(Component.literal(String.format("%d entries over %d tab%s in %.1fs%s -> ",
-                        entries.size(), Math.min(tabIndex + 1, Math.max(tabs.length, 1)),
+        say(Component.literal(String.format("%d refreshed, %d unchanged, %d tab%s in %.1fs%s -> ",
+                        refreshed, reused, Math.min(tabIndex + 1, Math.max(tabs.length, 1)),
                         tabs.length == 1 ? "" : "s", secs,
                         kicks == 0 ? "" : (" (survived " + kicks + " disconnect"
                                 + (kicks == 1 ? "" : "s") + ")")))

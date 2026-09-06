@@ -26,6 +26,26 @@ pacing every reopen would have been. Reopening the journal returns you to the pa
 were on, so a resume normally continues straight from the entry it was interrupted at, without
 re-navigating.
 
+## It only re-reads what changed
+
+Every run loads `journalscrape/journal-library.json` - everything previous runs collected - and
+compares each entry against the container's own unlock tier. Unchanged entries are copied forward
+without being opened at all, which means no dialog round trips **and no reopen command**, so a run
+with nothing new is fast and sends almost nothing to the server.
+
+The tier is taken from the progress line's DENOMINATOR (`[ 148 / 1,000 ]` -> `1,000`, or
+`complete`), not the progress itself. The numerator moves with every kill without unlocking
+anything; the denominator is the next threshold and only changes when a tier is actually crossed -
+which is exactly when the dialog gains content.
+
+```
+[journal] library: 287 entries from previous runs
+[journal] 3 refreshed, 284 unchanged, 6 tabs in 24.1s -> journal-library.json
+```
+
+`/journal force` ignores the library and re-reads everything. Entries the run never reaches are
+kept rather than dropped: the library is everything ever scraped, not a snapshot of one walk.
+
 ## What it captures
 
 Per entry: tab, page, name, container slot, enemy level, and every dialog page - title, body text, and any **drops**. The drop
