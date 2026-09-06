@@ -3,9 +3,13 @@
 A client-side Fabric mod for **Minecraft 26.2** that walks a server's `/journal` knowledge GUI,
 dumps every entry to JSON, and links the file in chat.
 
-Run `/journal` and it takes over: it normalises to the first tab and first page, then clicks each
-entry, reads every page of the dialog that opens, pages through the whole tab, and writes the
-result. `/journal 5` scrapes only the first five entries.
+Run `/journal` and it takes over: it walks every category tab, and every page of each - clicking
+each entry, reading every page of the dialog that opens - then writes the result. `/journal 5`
+scrapes only the first five entries.
+
+The tab list is read off the top row rather than hardcoded, so empty slots are skipped and a server
+that adds a category is picked up automatically. Slot 8 is deliberately never clicked: it is the
+Region Filter, and pressing it would change what the journal shows rather than move between tabs.
 
 **It survives a kick.** If the connection drops mid-walk - including because the server kicked you
 for the very commands this mod sends - the run is not lost: progress is written out immediately,
@@ -24,7 +28,7 @@ re-navigating.
 
 ## What it captures
 
-Per entry: name, container slot, and every page - title, body text, and any **drops**. The drop
+Per entry: tab, page, name, container slot, enemy level, and every dialog page - title, body text, and any **drops**. The drop
 names carry `ShowItem` hovers containing the server's own loot definition, which is kept verbatim
 as `lootData`:
 

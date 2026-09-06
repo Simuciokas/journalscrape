@@ -41,6 +41,10 @@ import net.minecraft.world.item.component.ItemLore;
  * the page's first entry changing - and moves on the tick it happens. A flat delay after every
  * action cost ~6s per entry however fast the server answered.
  *
+ * <p>IT WALKS EVERY TAB, AND EVERY PAGE OF EACH. The tab list is read off the top row rather than
+ * hardcoded, skipping empty slots - and never slot 8, which is the Region Filter and would change
+ * what the journal shows rather than move between categories.
+ *
  * <p>IT WALKS EVERY PAGE OF THE TAB. Pages OVERLAP BY ONE ENTRY - page N's last slot is page N+1's
  * first - so the stride is 31, not 32, and entries are de-duplicated by name AND level: duplicate
  * names are legitimate ("Stone Slime" exists at Enemy Level 14 and 15) so name alone would silently
@@ -69,7 +73,14 @@ public final class JournalScrape {
 
     private static final String COMMAND = "journal";
     private static final int JOURNAL_SLOTS = 90;
-    private static final int TAB_SLOT = 0;             // first category tab
+    /**
+     * Category tabs live in the top row. Slot 8 is EXCLUDED on purpose: it is the Region Filter,
+     * not a tab, and clicking it changes what the journal shows rather than moving between
+     * categories. Slots that hold no item (4 and 7 in the layout seen) are skipped automatically,
+     * so the tab list is discovered rather than hardcoded.
+     */
+    private static final int FIRST_TAB_SLOT = 0;
+    private static final int LAST_TAB_SLOT = 7;
     private static final int PREV_SLOT = 46;           // "Previous" (46 and 47 are duplicates)
     private static final int NEXT_SLOT = 51;           // "Next" (51 and 52 are duplicates)
 
@@ -100,6 +111,9 @@ public final class JournalScrape {
     private static int steps;                  // guard against paging forever
     private static int limit;                  // max entries to capture
     private static int gridPage;               // 0-based page of the tab being walked
+    private static int[] tabs = new int[0];    // container slots of the category tabs
+    private static String[] tabNames = new String[0];
+    private static int tabIndex;
     /** Ticks to let a fresh join settle before resuming - a command sent too early is wasted. */
     private static final int REJOIN_SETTLE = 60;
 
@@ -154,6 +168,9 @@ public final class JournalScrape {
         slotIndex = 0;
         dialogPage = 0;
         steps = 0;
+        tabs = new int[0];
+        tabNames = new String[0];
+        tabIndex = 0;
         commandsSent = 1;
         gridPage = 0;
         navAt = 0;
@@ -169,7 +186,7 @@ public final class JournalScrape {
         state = State.WAIT_GRID;
         wait = TIMEOUT;
         say(Component.literal((limit == Integer.MAX_VALUE
-                        ? "scraping every page of the first tab"
+                        ? "scraping every tab"
                         : ("scraping up to " + limit + " entries"))
                         + " - leave the GUI alone; a kick will pause it, not end it")
                 .withStyle(ChatFormatting.GRAY));
@@ -200,6 +217,15 @@ public final class JournalScrape {
         switch (state) {
             case WAIT_GRID -> {
                 if (gridOpen(mc)) {
+                    if (tabs.length == 0) {
+                        discoverTabs(mc);
+                        if (tabs.length == 0) {
+                            fail("found no category tabs");
+                            return;
+                        }
+                        say(Component.literal("found " + tabs.length + " tabs: "
+                                        + String.join(", ", tabNames)).withStyle(ChatFormatting.DARK_GRAY));
+                    }
                     state = State.CLICK_TAB;
                 } else if (--wait <= 0) {
                     fail("the journal did not open");
@@ -209,7 +235,7 @@ public final class JournalScrape {
             // nothing changing before the short timeout.
             case CLICK_TAB -> {
                 pageMarker = firstEntryName(mc);
-                clickSlot(mc, TAB_SLOT);
+                clickSlot(mc, tabs[tabIndex]);
                 state = State.WAIT_TAB;
                 wait = SHORT_TIMEOUT;
             }
@@ -282,7 +308,7 @@ public final class JournalScrape {
             // The page is done: advance the GRID. A page that refuses to change is the last one.
             case NEXT_GRID_PAGE -> {
                 if (++steps > MAX_PAGE_STEPS) {
-                    finish(mc);
+                    nextTab(mc);
                     return;
                 }
                 pageMarker = firstEntryName(mc);
@@ -298,7 +324,7 @@ public final class JournalScrape {
                     pageMarker = firstEntryName(mc);
                     state = State.OPEN_ENTRY;
                 } else if (--wait <= 0) {
-                    finish(mc);                       // no further pages in this tab
+                    nextTab(mc);                      // no further pages: on to the next category
                 }
             }
             case WAIT_RECONNECT -> {
@@ -345,6 +371,53 @@ public final class JournalScrape {
             }
             default -> { }
         }
+    }
+
+    /**
+     * Reads the category tabs off the top row. Anything empty is skipped, and the Region Filter in
+     * slot 8 is never included - clicking it would change the journal's contents mid-walk.
+     */
+    private static void discoverTabs(Minecraft mc) {
+        final AbstractContainerScreen<?> g = grid(mc);
+        if (g == null) {
+            return;
+        }
+        final List<Integer> slots = new ArrayList<>();
+        final List<String> names = new ArrayList<>();
+        for (int slot = FIRST_TAB_SLOT; slot <= LAST_TAB_SLOT; slot++) {
+            final ItemStack stack = g.getMenu().slots.get(slot).getItem();
+            if (stack.isEmpty()) {
+                continue;
+            }
+            slots.add(slot);
+            names.add(plain(stack.getHoverName()));
+        }
+        tabs = slots.stream().mapToInt(Integer::intValue).toArray();
+        tabNames = names.toArray(new String[0]);
+    }
+
+    /** Moves to the next category, or finishes when the last one has been walked. */
+    private static void nextTab(Minecraft mc) {
+        tabIndex++;
+        if (tabIndex >= tabs.length) {
+            finish(mc);
+            return;
+        }
+        gridPage = 0;
+        navAt = 0;
+        slotIndex = 0;
+        steps = 0;
+        // De-duplication is PER TAB: the overlap it exists for is between pages of one category,
+        // and the same name could legitimately appear in two categories.
+        seen.clear();
+        say(Component.literal("tab " + (tabIndex + 1) + "/" + tabs.length + ": " + tabNames[tabIndex]
+                        + " (" + entries.size() + " entries so far)").withStyle(ChatFormatting.DARK_GRAY));
+        save(false);
+        state = gridOpen(mc) ? State.CLICK_TAB : State.REOPEN;
+    }
+
+    private static String currentTabName() {
+        return (tabIndex < tabNames.length) ? tabNames[tabIndex] : "";
     }
 
     private static AbstractContainerScreen<?> grid(Minecraft mc) {
@@ -432,6 +505,7 @@ public final class JournalScrape {
         }
         currentKey = key;
         currentEntry = new JsonObject();
+        currentEntry.addProperty("tab", currentTabName());
         currentEntry.addProperty("page", gridPage + 1);
         currentEntry.addProperty("slot", slot);
         currentEntry.addProperty("name", plain(stack.getHoverName()));
@@ -505,7 +579,7 @@ public final class JournalScrape {
         root.addProperty("scrapedAt", LocalDateTime.now().toString());
         root.addProperty("durationMs", System.currentTimeMillis() - startedAt);
         root.addProperty("entryCount", entries.size());
-        root.addProperty("gridPages", gridPage + 1);
+        root.addProperty("tabsWalked", Math.min(tabIndex + 1, Math.max(tabs.length, 1)));
         root.addProperty("commandsSent", commandsSent);
         root.addProperty("disconnects", kicks);
         root.addProperty("complete", complete);
@@ -539,8 +613,9 @@ public final class JournalScrape {
                                 Component.literal(file.toAbsolutePath().toString())
                                         .append(Component.literal("\nclick to open the folder")
                                                 .withStyle(ChatFormatting.GRAY)))));
-        say(Component.literal(String.format("%d entries over %d page%s in %.1fs%s -> ",
-                        entries.size(), gridPage + 1, gridPage == 0 ? "" : "s", secs,
+        say(Component.literal(String.format("%d entries over %d tab%s in %.1fs%s -> ",
+                        entries.size(), Math.min(tabIndex + 1, Math.max(tabs.length, 1)),
+                        tabs.length == 1 ? "" : "s", secs,
                         kicks == 0 ? "" : (" (survived " + kicks + " disconnect"
                                 + (kicks == 1 ? "" : "s") + ")")))
                 .withStyle(ChatFormatting.GREEN).append(link));
