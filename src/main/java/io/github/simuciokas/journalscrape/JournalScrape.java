@@ -474,7 +474,12 @@ public final class JournalScrape {
                 ContainerInput.PICKUP, mc.player);
     }
 
-    /** Entries are keyed by name AND level: the same name legitimately exists at two levels. */
+    /**
+     * The entry's identity: tab, name and enemy level. Never its slot or page - a newly unlocked
+     * entry appears in the MIDDLE of a tab, not at the end, and everything after it shifts along.
+     * Level is part of the key because one name can legitimately exist at two levels; it is empty
+     * on the tabs that have no level line, where the name alone is unique.
+     */
     private static String keyOf(ItemStack stack) {
         return currentTabName() + "|" + plain(stack.getHoverName()) + "|" + levelOf(stack);
     }
@@ -559,6 +564,12 @@ public final class JournalScrape {
         final JsonObject known = library.get(key);
         if (!force && known != null && !tier.isEmpty()
                 && tier.equals(known.has("tier") ? known.get("tier").getAsString() : null)) {
+            // The identity is the KEY, never the position: new entries appear in the middle of a
+            // tab (the monster list is ordered by level), which shifts everything after them onto
+            // different slots and pages. Refresh that positional metadata so it describes where the
+            // entry is now rather than where it used to be.
+            known.addProperty("page", gridPage + 1);
+            known.addProperty("slot", slot);
             entries.add(known);
             seen.add(key);
             reused++;

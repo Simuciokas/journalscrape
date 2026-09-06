@@ -43,6 +43,11 @@ which is exactly when the dialog gains content.
 [journal] 3 refreshed, 284 unchanged, 6 tabs in 24.1s -> journal-library.json
 ```
 
+Entries are identified by **tab + name + enemy level**, never by slot or page. A newly unlocked
+entry appears in the middle of a tab rather than at the end - the monster list is ordered by level -
+so everything after it shifts onto different slots and pages, and a positional identity would
+mis-match every entry below the insertion point.
+
 `/journal force` ignores the library and re-reads everything. Entries the run never reaches are
 kept rather than dropped: the library is everything ever scraped, not a snapshot of one walk.
 
