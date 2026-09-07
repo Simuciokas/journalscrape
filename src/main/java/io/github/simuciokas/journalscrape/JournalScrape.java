@@ -76,6 +76,7 @@ public final class JournalScrape {
     public static final String MOD_ID = "journalscrape";
 
     private static final String COMMAND = "journal";
+    private static final String UPLOAD_COMMAND = "journalupload";
     private static final int JOURNAL_SLOTS = 90;
     /**
      * Category tabs live in the top row. Slot 8 is EXCLUDED on purpose: it is the Region Filter,
@@ -85,8 +86,18 @@ public final class JournalScrape {
      */
     private static final int FIRST_TAB_SLOT = 0;
     private static final int LAST_TAB_SLOT = 7;
-    private static final int PREV_SLOT = 46;           // "Previous" (46 and 47 are duplicates)
-    private static final int NEXT_SLOT = 51;           // "Next" (51 and 52 are duplicates)
+    /**
+     * The pagination row, searched by BUTTON NAME rather than by slot.
+     *
+     * <p>The buttons are duplicated for a wider click target - Previous at 46 and 47, Next at 51
+     * and 52 - but the server re-sends that row constantly and individual slots are transiently
+     * EMPTY while it does. Clicking a fixed slot therefore does nothing whenever it happens to be
+     * mid-refresh, and the walk reads that silence as "there is no next page", ending a tab early
+     * or deciding it is already on page one. Observed live: three reads of the row in a row gave
+     * {47,51,52}, {46,47,51,52} and {46,47,51,52}.
+     */
+    private static final int NAV_FIRST = 45;
+    private static final int NAV_LAST = 53;
 
     // NO THROTTLE ON THE REOPEN COMMAND, deliberately. The walk sends /journal once per entry, as
     // fast as the state machine can go, which a server may well treat as command spam - it has
@@ -94,7 +105,8 @@ public final class JournalScrape {
     // the run, it parks the walk and resumes at the entry it was on. Speed is preferred to the
     // pause, on the bet that rejoining is quicker than pacing every reopen.
     private static final int TIMEOUT = 60;             // waiting for a server-pushed screen
-    private static final int SHORT_TIMEOUT = 12;       // "did anything change?" probe
+    private static final int SHORT_TIMEOUT = 20;       // "did anything change?" probe
+    private static final int KNOWN_TIMEOUT = 120;      // 6s for the collector to answer
     private static final int MAX_PAGE_STEPS = 40;      // a book this long means something is wrong
     private static final int MAX_PAGES = 8;            // dialog pages within one entry
 
@@ -103,7 +115,7 @@ public final class JournalScrape {
     private static final DateTimeFormatter STAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
 
     private enum State {
-        IDLE, WAIT_GRID, CLICK_TAB, WAIT_TAB, PAGE_BACK, WAIT_PAGE_BACK,
+        IDLE, WAIT_KNOWN, WAIT_GRID, CLICK_TAB, WAIT_TAB, PAGE_BACK, WAIT_PAGE_BACK,
         NAV_FORWARD, WAIT_NAV_FORWARD, OPEN_ENTRY, WAIT_DIALOG, READ_PAGE, WAIT_NEXT_PAGE,
         NEXT_GRID_PAGE, WAIT_GRID_PAGE, REOPEN, WAIT_REGRID, WAIT_RECONNECT
     }
@@ -123,15 +135,29 @@ public final class JournalScrape {
 
     private static int commandsSent;
     private static int navAt;                  // page reached while navigating back to gridPage
-    private static String pageMarker = "";     // first entry's name on the current page
+    private static String pageMarker = "";     // fingerprint of the page being walked
+    private static String lastFp = "";         // previous tick's fingerprint, to spot settling
+    private static boolean fpStable;           // fingerprint unchanged since last tick?
     private static Dialog lastDialog;
     private static String currentKey = "";     // marked as seen only once the entry is finished
     private static Path outFile;               // fixed at the start so partial saves land in it
+    private static Path lastWritten;           // what the [upload] button in chat refers to
     /** Everything ever scraped, keyed by tab|name|level, carried between runs. */
     private static Map<String, JsonObject> library = new LinkedHashMap<>();
+    /**
+     * What the COLLECTOR already knows: key -> unlock tier, fetched once per run.
+     *
+     * <p>The local library only knows what this client has read. Someone else may already have
+     * read an entry to a tier this player cannot exceed, and opening it would produce nothing the
+     * collector does not hold - so it is walked past. Empty when the collector is unreachable or
+     * not configured, which simply means nothing is skipped on its account.
+     */
+    private static volatile JsonObject remoteTiers;
+    private static volatile boolean remoteDone;
     private static boolean force;              // rescrape even where the tier is unchanged
     private static int reused;
     private static int refreshed;
+    private static int skipped;                // already known to the collector, never opened
     private static int kicks;
     private static JsonObject currentEntry;
     private static JsonArray entries;
@@ -149,6 +175,28 @@ public final class JournalScrape {
             }
         }
         return out.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    /**
+     * The chat button's command. Unlike the journal command this one IS cancelled - it exists only
+     * for the client, and letting it reach the server would just earn an "unknown command" reply.
+     * A button is used rather than a typed command because it appears exactly where the file path
+     * is already shown, and because uploading should be a deliberate click.
+     */
+    public static boolean onUploadCommand(String command) {
+        if (command == null) {
+            return false;
+        }
+        final String c = command.trim().toLowerCase();
+        if (!c.equals(UPLOAD_COMMAND) && !c.startsWith(UPLOAD_COMMAND + " ")) {
+            return false;
+        }
+        if (lastWritten == null) {
+            say(Component.literal("nothing scraped yet this session").withStyle(ChatFormatting.YELLOW));
+        } else {
+            Uploader.upload(lastWritten);
+        }
+        return true;
     }
 
     /** True when the command was ours. Never cancels: the journal still has to open. */
@@ -194,14 +242,30 @@ public final class JournalScrape {
         kicks = 0;
         reused = 0;
         refreshed = 0;
+        skipped = 0;
         currentKey = "";
+        remoteTiers = null;
+        remoteDone = false;
         loadLibrary();
         startedAt = System.currentTimeMillis();
         // Chosen up front so every partial save through the run lands in the same file.
         outFile = Minecraft.getInstance().gameDirectory.toPath().resolve(MOD_ID)
                 .resolve("journal-" + LocalDateTime.now().format(STAMP) + ".json");
-        state = State.WAIT_GRID;
-        wait = TIMEOUT;
+        // ASK THE COLLECTOR FIRST. On a background thread, with the walk parked until it answers
+        // or the wait runs out - a slow or dead collector must not stop the scrape, only make it do
+        // more work.
+        if (!force && !Uploader.knownUrl().isBlank()) {
+            state = State.WAIT_KNOWN;
+            wait = KNOWN_TIMEOUT;
+            Thread.ofVirtual().name("journalscrape-known").start(() -> {
+                final JsonObject t = Uploader.fetchKnown();
+                remoteTiers = t;
+                remoteDone = true;
+            });
+        } else {
+            state = State.WAIT_GRID;
+            wait = TIMEOUT;
+        }
         say(Component.literal((limit == Integer.MAX_VALUE
                         ? "scraping every tab"
                         : ("scraping up to " + limit + " entries"))
@@ -214,6 +278,13 @@ public final class JournalScrape {
         if (state == State.IDLE || mc == null || mc.gui == null) {
             return;
         }
+        // The container's contents flicker while the server re-sends them, so every decision
+        // below is made on a fingerprint that has held still for a tick. Acting on a half-drawn
+        // page is what made the walk re-navigate at random.
+        final String fp = pageFingerprint(mc);
+        fpStable = fp.equals(lastFp);
+        lastFp = fp;
+
         // A KICK IS NOT THE END OF THE WALK. Losing the connection used to abandon the run and
         // throw away everything collected; now the progress is written out and the walk parks
         // until you are back in, then picks up at the entry it was on.
@@ -232,8 +303,26 @@ public final class JournalScrape {
             return;
         }
         switch (state) {
+            case WAIT_KNOWN -> {
+                if (remoteDone || --wait <= 0) {
+                    final int n = (remoteTiers == null) ? 0 : remoteTiers.size();
+                    if (n > 0) {
+                        say(Component.literal("the collector knows " + n
+                                        + " entries - those will be walked past, not opened")
+                                .withStyle(ChatFormatting.DARK_GRAY));
+                    } else if (remoteDone) {
+                        say(Component.literal("the collector had nothing to share - scraping everything")
+                                .withStyle(ChatFormatting.DARK_GRAY));
+                    } else {
+                        say(Component.literal("the collector did not answer in time - scraping everything")
+                                .withStyle(ChatFormatting.DARK_GRAY));
+                    }
+                    state = State.WAIT_GRID;
+                    wait = TIMEOUT;
+                }
+            }
             case WAIT_GRID -> {
-                if (gridOpen(mc)) {
+                if (gridOpen(mc) && fpStable) {
                     if (tabs.length == 0) {
                         discoverTabs(mc);
                         if (tabs.length == 0) {
@@ -251,13 +340,13 @@ public final class JournalScrape {
             // Normalise: first tab, then page back to the start. Both detect "already there" by
             // nothing changing before the short timeout.
             case CLICK_TAB -> {
-                pageMarker = firstEntryName(mc);
+                pageMarker = fp;
                 clickSlot(mc, tabs[tabIndex]);
                 state = State.WAIT_TAB;
                 wait = SHORT_TIMEOUT;
             }
             case WAIT_TAB -> {
-                if (changed(mc)) {
+                if (changed(fp)) {
                     state = State.PAGE_BACK;
                 } else if (--wait <= 0) {
                     state = State.PAGE_BACK;
@@ -268,17 +357,17 @@ public final class JournalScrape {
                     fail("could not reach the first page");
                     return;
                 }
-                pageMarker = firstEntryName(mc);
-                clickSlot(mc, PREV_SLOT);
+                pageMarker = fp;
+                clickNav(mc, "Previous");
                 state = State.WAIT_PAGE_BACK;
                 wait = SHORT_TIMEOUT;
             }
             case WAIT_PAGE_BACK -> {
-                if (changed(mc)) {
+                if (changed(fp)) {
                     state = State.PAGE_BACK;          // moved, so there may be further back to go
                 } else if (--wait <= 0) {
                     navAt = 0;                        // this is page 0
-                    pageMarker = firstEntryName(mc);
+                    pageMarker = fp;
                     state = (navAt < gridPage) ? State.NAV_FORWARD : State.OPEN_ENTRY;
                 }
             }
@@ -288,15 +377,15 @@ public final class JournalScrape {
                     fail("could not return to page " + (gridPage + 1));
                     return;
                 }
-                pageMarker = firstEntryName(mc);
-                clickSlot(mc, NEXT_SLOT);
+                pageMarker = fp;
+                clickNav(mc, "Next");
                 state = State.WAIT_NAV_FORWARD;
                 wait = SHORT_TIMEOUT;
             }
             case WAIT_NAV_FORWARD -> {
-                if (changed(mc)) {
+                if (changed(fp)) {
                     navAt++;
-                    pageMarker = firstEntryName(mc);
+                    pageMarker = fp;
                     state = (navAt < gridPage) ? State.NAV_FORWARD : State.OPEN_ENTRY;
                 } else if (--wait <= 0) {
                     fail("ran out of pages returning to page " + (gridPage + 1));
@@ -328,17 +417,17 @@ public final class JournalScrape {
                     nextTab(mc);
                     return;
                 }
-                pageMarker = firstEntryName(mc);
-                clickSlot(mc, NEXT_SLOT);
+                pageMarker = fp;
+                clickNav(mc, "Next");
                 state = State.WAIT_GRID_PAGE;
                 wait = SHORT_TIMEOUT;
             }
             case WAIT_GRID_PAGE -> {
-                if (changed(mc)) {
+                if (changed(fp)) {
                     gridPage++;
                     navAt = gridPage;
                     slotIndex = 0;
-                    pageMarker = firstEntryName(mc);
+                    pageMarker = fp;
                     state = State.OPEN_ENTRY;
                 } else if (--wait <= 0) {
                     nextTab(mc);                      // no further pages: on to the next category
@@ -374,9 +463,9 @@ public final class JournalScrape {
                 }
             }
             case WAIT_REGRID -> {
-                if (gridOpen(mc)) {
+                if (gridOpen(mc) && fpStable) {
                     // Reopened on the right page? Otherwise navigate back to it.
-                    if (firstEntryName(mc).equals(pageMarker)) {
+                    if (fp.equals(pageMarker)) {
                         state = State.OPEN_ENTRY;
                     } else {
                         steps = 0;
@@ -446,9 +535,43 @@ public final class JournalScrape {
         return grid(mc) != null;
     }
 
-    /** Has the grid moved since pageMarker was taken? The page's first entry is the fingerprint. */
-    private static boolean changed(Minecraft mc) {
-        return gridOpen(mc) && !firstEntryName(mc).equals(pageMarker);
+    /** Has the page moved since pageMarker was taken - and settled again? */
+    private static boolean changed(String fp) {
+        return fpStable && !fp.isEmpty() && !fp.equals(pageMarker);
+    }
+
+    /**
+     * Every entry name on the page, joined. A single slot is too weak a fingerprint: it is blank
+     * for a moment on every refresh, and a blank compares unequal to whatever it was, which makes
+     * the walk think the page changed when it has not.
+     */
+    private static String pageFingerprint(Minecraft mc) {
+        final AbstractContainerScreen<?> g = grid(mc);
+        if (g == null) {
+            return "";
+        }
+        final StringBuilder sb = new StringBuilder(256);
+        for (int slot : ENTRY_SLOTS) {
+            final ItemStack stack = g.getMenu().slots.get(slot).getItem();
+            sb.append(stack.isEmpty() ? "-" : plain(stack.getHoverName())).append('|');
+        }
+        return sb.toString();
+    }
+
+    /** Clicks the pagination button with this label, wherever the server has put it this tick. */
+    private static boolean clickNav(Minecraft mc, String label) {
+        final AbstractContainerScreen<?> g = grid(mc);
+        if (g == null) {
+            return false;
+        }
+        for (int slot = NAV_FIRST; slot <= NAV_LAST; slot++) {
+            final ItemStack stack = g.getMenu().slots.get(slot).getItem();
+            if (!stack.isEmpty() && plain(stack.getHoverName()).contains(label)) {
+                clickSlot(mc, slot);
+                return true;
+            }
+        }
+        return false;                          // mid-refresh: the retry comes round next tick
     }
 
     private static Dialog dialogOf(Minecraft mc) {
@@ -576,6 +699,16 @@ public final class JournalScrape {
             slotIndex++;
             return;
         }
+        // ALREADY KNOWN TO EVERYONE ELSE? Then there is nothing to gain from opening it. Not added
+        // to this run's entries: the point is that the collector holds it, and a copy this client
+        // never read is not this client's to send. A local copy, if there is one, still goes out
+        // with the file as usual.
+        if (!force && covered(key, tier)) {
+            seen.add(key);
+            skipped++;
+            slotIndex++;
+            return;
+        }
         currentKey = key;
         currentEntry = new JsonObject();
         currentEntry.addProperty("key", key);
@@ -658,6 +791,42 @@ public final class JournalScrape {
      * forward instead of being re-read, which is the whole point: an entry that is skipped costs
      * no dialog round trips and no reopen command, so a run with nothing new is quick and quiet.
      */
+    /**
+     * Does the collector already hold this entry at a tier this player cannot beat?
+     *
+     * <p>Tiers rank as a number - the next threshold - with "complete" above all of them. Equal
+     * ranks are covered too: the same tier shows the same pages. An unreadable tier on either side
+     * ranks below everything, so the entry gets opened; being slow is the safe way to be wrong.
+     */
+    private static boolean covered(String key, String mine) {
+        final JsonObject t = remoteTiers;
+        if (t == null || !t.has(key)) {
+            return false;
+        }
+        final int theirs = tierRank(t.get(key).getAsString());
+        final int ours = tierRank(mine);
+        return theirs >= 0 && ours >= 0 && theirs >= ours;
+    }
+
+    /** "complete" beats every threshold; "[ 148 / 1,000 ]" ranks as its 1000. -1 = unreadable. */
+    private static int tierRank(String tier) {
+        if (tier == null || tier.isEmpty()) {
+            return -1;
+        }
+        if (tier.equalsIgnoreCase("complete")) {
+            return Integer.MAX_VALUE;
+        }
+        final String digits = tier.replaceAll("[^0-9]", "");
+        if (digits.isEmpty()) {
+            return -1;
+        }
+        try {
+            return Integer.parseInt(digits);
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
     private static void loadLibrary() {
         library = new LinkedHashMap<>();
         final Path f = libraryFile();
@@ -713,6 +882,7 @@ public final class JournalScrape {
         root.addProperty("thisRun", entries.size());
         root.addProperty("refreshed", refreshed);
         root.addProperty("reusedFromLibrary", reused);
+        root.addProperty("skippedAlreadyCollected", skipped);
         root.addProperty("tabsWalked", Math.min(tabIndex + 1, Math.max(tabs.length, 1)));
         root.addProperty("commandsSent", commandsSent);
         root.addProperty("disconnects", kicks);
@@ -738,6 +908,7 @@ public final class JournalScrape {
             return;
         }
 
+        lastWritten = file;
         final double secs = (System.currentTimeMillis() - startedAt) / 1000.0;
         final MutableComponent link = Component.literal(file.getFileName().toString())
                 .withStyle(Style.EMPTY
@@ -748,12 +919,25 @@ public final class JournalScrape {
                                 Component.literal(file.toAbsolutePath().toString())
                                         .append(Component.literal("\nclick to open the folder")
                                                 .withStyle(ChatFormatting.GRAY)))));
-        say(Component.literal(String.format("%d refreshed, %d unchanged, %d tab%s in %.1fs%s -> ",
-                        refreshed, reused, Math.min(tabIndex + 1, Math.max(tabs.length, 1)),
-                        tabs.length == 1 ? "" : "s", secs,
-                        kicks == 0 ? "" : (" (survived " + kicks + " disconnect"
-                                + (kicks == 1 ? "" : "s") + ")")))
-                .withStyle(ChatFormatting.GREEN).append(link));
+        MutableComponent line = Component.literal(
+                        String.format("%d refreshed, %d unchanged, %d already collected, "
+                                        + "%d tab%s in %.1fs%s -> ",
+                                refreshed, reused, skipped,
+                                Math.min(tabIndex + 1, Math.max(tabs.length, 1)),
+                                tabs.length == 1 ? "" : "s", secs,
+                                kicks == 0 ? "" : (" (survived " + kicks + " disconnect"
+                                        + (kicks == 1 ? "" : "s") + ")")))
+                .withStyle(ChatFormatting.GREEN).append(link);
+        if (Uploader.configured()) {
+            line = line.append(Component.literal("  [upload]").withStyle(Style.EMPTY
+                    .withColor(ChatFormatting.YELLOW)
+                    .withBold(true)
+                    .withClickEvent(new ClickEvent.RunCommand("/" + UPLOAD_COMMAND))
+                    .withHoverEvent(new HoverEvent.ShowText(Component.literal(
+                            "Send this scrape to the collector.\nEntries merge: a thinner journal "
+                            + "never overwrites a fuller one.")))));
+        }
+        say(line);
         state = State.IDLE;
     }
 
