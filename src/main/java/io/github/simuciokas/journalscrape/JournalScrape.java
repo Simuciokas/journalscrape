@@ -584,7 +584,9 @@ public final class JournalScrape {
         currentEntry.addProperty("page", gridPage + 1);
         currentEntry.addProperty("slot", slot);
         currentEntry.addProperty("name", plain(stack.getHoverName()));
-        final String level = key.substring(key.indexOf('|') + 1);
+        // The LAST separator: the key is tab|name|level and monster names are not pipe-free by
+        // luck alone - taking the first one recorded "Sewer Rat|21" as the enemy level.
+        final String level = key.substring(key.lastIndexOf('|') + 1);
         if (!level.isEmpty()) {
             currentEntry.addProperty("enemyLevel", level);
         }
