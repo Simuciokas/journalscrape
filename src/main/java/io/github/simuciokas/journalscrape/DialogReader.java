@@ -3,19 +3,26 @@ package io.github.simuciokas.journalscrape;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import net.minecraft.client.gui.components.AbstractButton;
 import net.minecraft.client.gui.components.AbstractWidget;
 import net.minecraft.client.gui.components.events.ContainerEventHandler;
 import net.minecraft.client.gui.components.events.GuiEventListener;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.dialog.DialogScreen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
+import net.minecraft.network.chat.Style;
 import net.minecraft.server.dialog.ActionButton;
 import net.minecraft.server.dialog.Dialog;
 import net.minecraft.server.dialog.MultiActionDialog;
 import net.minecraft.server.dialog.body.DialogBody;
 import net.minecraft.server.dialog.body.PlainMessage;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
 
 /**
  * Turns one dialog page into JSON, and presses its "Next" button.
@@ -88,6 +95,10 @@ final class DialogReader {
             if (!name.isEmpty()) {
                 final JsonObject drop = new JsonObject();
                 drop.addProperty("name", name);
+                final JsonArray tip = tooltip(show);
+                if (tip != null && !tip.isEmpty()) {
+                    drop.add("tooltip", tip);
+                }
                 final String dump = String.valueOf(show.item());
                 final int at = dump.indexOf("loot.item_data");
                 if (at >= 0) {
@@ -105,6 +116,116 @@ final class DialogReader {
         for (Component child : siblings) {
             collectHovers(child, into, depth + 1);
         }
+    }
+
+    /**
+     * The item's tooltip AS THE PLAYER SEES IT.
+     *
+     * <p>The hover carries a full item, so rather than inventing a presentation from the loot data
+     * we ask the game to render the same lines it would show under the cursor - name, stats,
+     * flavour - each with its own colour. That way the viewer can show something a player already
+     * knows how to read instead of a table in a format nobody has seen before.
+     *
+     * <p>The server pads its tooltips with private-use glyphs that act as icons and spacers. They
+     * cannot render outside the game, so they are stripped; a line left empty is kept once as a
+     * blank, and runs of blanks collapse, which preserves the shape without the noise.
+     */
+    private static JsonArray tooltip(HoverEvent.ShowItem show) {
+        final Minecraft mc = Minecraft.getInstance();
+        if (mc == null || mc.level == null || mc.player == null) {
+            return null;
+        }
+        try {
+            final ItemStack stack = show.item().create();
+            final List<Component> lines =
+                    stack.getTooltipLines(Item.TooltipContext.of(mc.level), mc.player, TooltipFlag.NORMAL);
+            final JsonArray out = new JsonArray();
+            boolean lastBlank = false;
+            for (Component line : lines) {
+                final String text = line.getString().replaceAll("[^\\x20-\\x7E]", "");
+                final boolean blank = text.isBlank();
+                if (blank && lastBlank) {
+                    continue;
+                }
+                lastBlank = blank;
+                final JsonObject row = new JsonObject();
+                row.addProperty("t", blank ? "" : stripTrailing(text));
+                if (!blank) {
+                    // ALWAYS as runs, even when there is only one. The array is what tells a
+                    // reader that the colours were resolved per segment; a bare colour means the
+                    // row came from the old capture, where the recorded colour was the outer
+                    // component's - and for item lore that is vanilla's placeholder purple, not
+                    // anything the server chose.
+                    final JsonArray runs = runs(line);
+                    if (!runs.isEmpty()) {
+                        row.add("r", runs);
+                    }
+                }
+                out.add(row);
+            }
+            while (!out.isEmpty() && out.get(out.size() - 1).getAsJsonObject()
+                    .get("t").getAsString().isEmpty()) {
+                out.remove(out.size() - 1);          // trailing spacers add nothing
+            }
+            return out;
+        } catch (Exception e) {
+            return null;                              // never let a tooltip break the scrape
+        }
+    }
+
+    /**
+     * One line split into its coloured pieces.
+     *
+     * <p>THE LINE'S OWN STYLE IS NOT THE LINE'S COLOUR. The server builds a lore line as a base
+     * component carrying a colour with differently coloured children appended to it, so reading
+     * {@code line.getStyle().getColor()} paints the whole line in the base colour and throws away
+     * every highlight - which made every stat, requirement and flavour line render identically.
+     * Visiting the tree resolves each piece's style against its parents, exactly as the game does
+     * when it draws the tooltip.
+     */
+    private static JsonArray runs(Component line) {
+        final JsonArray runs = new JsonArray();
+        try {
+            line.visit((style, piece) -> {
+                final String text = piece.replaceAll("[^\\x20-\\x7E]", "");
+                if (text.isEmpty()) {
+                    return Optional.empty();
+                }
+                final String colour = style.getColor() == null ? null : style.getColor().serialize();
+                // Adjacent pieces in the same colour are one run: the server splits lines on every
+                // style change, including ones that do not change the colour.
+                if (!runs.isEmpty()) {
+                    final JsonObject last = runs.get(runs.size() - 1).getAsJsonObject();
+                    final String lastColour = last.has("c") ? last.get("c").getAsString() : null;
+                    if (Objects.equals(lastColour, colour)) {
+                        last.addProperty("t", last.get("t").getAsString() + text);
+                        return Optional.empty();
+                    }
+                }
+                final JsonObject run = new JsonObject();
+                run.addProperty("t", text);
+                if (colour != null) {
+                    run.addProperty("c", colour);
+                }
+                runs.add(run);
+                return Optional.empty();
+            }, Style.EMPTY);
+        } catch (Exception ignored) {
+            // an uncoloured line is fine
+        }
+        if (!runs.isEmpty()) {
+            final JsonObject last = runs.get(runs.size() - 1).getAsJsonObject();
+            last.addProperty("t", stripTrailing(last.get("t").getAsString()));
+        }
+        return runs;
+    }
+
+    private static String stripTrailing(String s) {
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == ' ') {
+            end--;
+        }
+        return s.substring(0, end);
     }
 
     /** The JSON object starting at {@code from}, cut at its matching brace rather than a length. */
