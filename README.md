@@ -20,11 +20,25 @@ one - disconnect or close the game if you need a run to stop. The output records
 a `complete` flag, and partial results are saved every 10 entries anyway, so even a crash leaves a
 usable file.
 
-**No command throttle.** Reading an entry closes the grid, so the walk re-issues `/journal` once
-per entry, as fast as it can - which a server may treat as command spam. That is accepted rather
-than prevented: a kick pauses the walk instead of ending it, and rejoining is usually quicker than
-pacing every reopen would have been. Reopening the journal returns you to the page you were on, so
-a resume normally continues straight from the entry it was interrupted at, without re-navigating.
+**It paces itself, and the pace adapts.** Reading an entry closes the grid, so the walk re-issues
+`/journal` once per entry. Sent flat out that reads as command spam and servers kick for it, which
+floods chat with join/leave messages and, on a journal of any size, ends up slower than pacing
+would have been. So there is a gap before each reopen - `entry-delay-ticks`, 1 second by default -
+and it **doubles after every disconnect** up to `max-entry-delay-ticks`, so a run converges on a
+pace the server tolerates instead of fighting it. The value that worked is remembered in
+`journalscrape/pace.txt`, so a kick is a lesson learned once rather than every run.
+
+The gap spaces out *commands*, so it is only paid for entries that actually get opened. A resumed
+run, or one where the collector already holds most entries, walks past them without waiting.
+
+A kick is still not fatal: it pauses the walk and resumes at the entry it was on, and reopening the
+journal returns you to the page you were on, so a resume normally continues without re-navigating.
+
+**You can stop part-way.** A journal with hundreds of entries is not something to be trapped in.
+Hold the stop key - `K` by default, `stop-key` in the config, `none` to disable - or set
+`max-minutes` to stop on a timer. Either way the file is written and reported with its `[upload]`
+button, marked `"complete": false`, and running `/journal` again carries on: entries already
+collected are not re-read.
 
 ## It only opens what it might learn from
 
@@ -101,6 +115,11 @@ to whatever collector you have configured. Nothing is ever sent without that cli
 `config/journalscrape.txt` is written on first launch:
 
 ```
+entry-delay-ticks=20          # gap before each /journal reopen; 0 is as fast as possible
+max-entry-delay-ticks=80      # ceiling the doubling backs off to
+stop-key=k                    # hold to end a run early; "none" to disable
+max-minutes=0                 # stop on a timer; 0 for no limit
+
 upload-url=https://your-collector.example/api/upload
 upload-token=
 known-url=
@@ -231,8 +250,15 @@ Working. A full run has completed end to end against a live journal - 279 entrie
 tab walking, tier-diffed incremental runs and the tooltip capture all exercised.
 
 **Not yet exercised in game:** the collector index check (`GET /api/known`) that skips entries
-other players have already read. Its ranking rules are unit-tested against a real index and the
-fetch fails open, but no live run has used it yet.
+other players have already read, and the pacing/stop work in 1.1.0. The index's ranking rules are
+tested against a real index and its fetch fails open; the pacing compiles and is reviewed but no
+live run has used either yet.
+
+The pacing exists because of feedback from a player with a far larger journal than mine: flat out
+it kicked him repeatedly, flooded chat with join/leave messages, and had not finished the first
+category after 600 entries. The adaptive gap, the stop key and the timer are the answer to that.
+The defaults are deliberately cautious - `entry-delay-ticks=0` restores the old behaviour on a
+server that does not mind.
 
 ## License
 

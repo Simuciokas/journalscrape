@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.ChatFormatting;
+import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.dialog.DialogScreen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
@@ -99,16 +100,19 @@ public final class JournalScrape {
     private static final int NAV_FIRST = 45;
     private static final int NAV_LAST = 53;
 
-    // NO THROTTLE ON THE REOPEN COMMAND, deliberately. The walk sends /journal once per entry, as
-    // fast as the state machine can go, which a server may well treat as command spam - it has
-    // kicked for it before. That is accepted rather than prevented: a disconnect no longer loses
-    // the run, it parks the walk and resumes at the entry it was on. Speed is preferred to the
-    // pause, on the bet that rejoining is quicker than pacing every reopen.
+    // THE REOPEN COMMAND IS PACED, AND THE PACE ADAPTS. The walk sends /journal once per entry;
+    // sent flat out that reads as command spam, and servers kick for it - which floods chat with
+    // join/leave messages and, on a journal of any size, makes the run slower than pacing would
+    // have been. So there is a gap before each reopen, and it DOUBLES on every disconnect up to a
+    // ceiling, so a run converges on a pace the server tolerates instead of fighting it. The value
+    // that worked is remembered for the next run.
     private static final int TIMEOUT = 60;             // waiting for a server-pushed screen
     private static final int SHORT_TIMEOUT = 20;       // "did anything change?" probe
     private static final int KNOWN_TIMEOUT = 120;      // 6s for the collector to answer
     private static final int MAX_PAGE_STEPS = 40;      // a book this long means something is wrong
     private static final int MAX_PAGES = 8;            // dialog pages within one entry
+    private static final int PACE_DEFAULT = 20;        // 1s before each reopen, unless configured
+    private static final int PACE_CEILING = 80;        // never crawl slower than 4s per entry
 
     private static final int[] ENTRY_SLOTS = buildEntrySlots();
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
@@ -134,6 +138,12 @@ public final class JournalScrape {
     private static final int REJOIN_SETTLE = 60;
 
     private static int commandsSent;
+    private static int paceTicks;              // gap before a reopen command, learned across runs
+    private static int paceCeiling;
+    private static int paceLeft;               // ticks still to wait before the next reopen
+    private static int stopKey;                // held down to end a run cleanly, mid-walk
+    private static long deadline;              // 0 = no time limit
+    private static boolean stopping;
     private static int navAt;                  // page reached while navigating back to gridPage
     private static String pageMarker = "";     // fingerprint of the page being walked
     private static String lastFp = "";         // previous tick's fingerprint, to spot settling
@@ -246,6 +256,14 @@ public final class JournalScrape {
         currentKey = "";
         remoteTiers = null;
         remoteDone = false;
+        paceTicks = Math.max(0, Uploader.setting("entry-delay-ticks", PACE_DEFAULT));
+        paceCeiling = Math.max(paceTicks, Uploader.setting("max-entry-delay-ticks", PACE_CEILING));
+        paceTicks = Math.min(loadPace(paceTicks), paceCeiling);
+        paceLeft = 0;
+        stopKey = keyCode(Uploader.setting("stop-key", "k"));
+        final int budget = Math.max(0, Uploader.setting("max-minutes", 0));
+        deadline = budget == 0 ? 0L : System.currentTimeMillis() + budget * 60_000L;
+        stopping = false;
         loadLibrary();
         startedAt = System.currentTimeMillis();
         // Chosen up front so every partial save through the run lands in the same file.
@@ -271,6 +289,12 @@ public final class JournalScrape {
                         : ("scraping up to " + limit + " entries"))
                         + " - leave the GUI alone; a kick will pause it, not end it")
                 .withStyle(ChatFormatting.GRAY));
+        say(Component.literal(String.format(
+                        "pacing %.1fs between entries%s - hold %s to stop and keep what is done",
+                        paceTicks / 20.0,
+                        deadline == 0 ? "" : (", stopping after " + budget + " min"),
+                        Uploader.setting("stop-key", "k").toUpperCase()))
+                .withStyle(ChatFormatting.DARK_GRAY));
         return true;
     }
 
@@ -285,6 +309,23 @@ public final class JournalScrape {
         fpStable = fp.equals(lastFp);
         lastFp = fp;
 
+        // STOPPING IS A FIRST-CLASS OUTCOME, not a failure: a journal with hundreds of entries is
+        // not something to be trapped in. Either signal writes the file and reports it, and the next
+        // run carries on from what is collected rather than starting over.
+        if (!stopping && state != State.IDLE) {
+            if (stopKey != 0 && isKeyHeld(mc, stopKey)) {
+                stopping = true;
+                stopRun(mc, "stopped on the "
+                        + Uploader.setting("stop-key", "k").toUpperCase() + " key");
+                return;
+            }
+            if (deadline != 0 && System.currentTimeMillis() > deadline) {
+                stopping = true;
+                stopRun(mc, "time is up");
+                return;
+            }
+        }
+
         // A KICK IS NOT THE END OF THE WALK. Losing the connection used to abandon the run and
         // throw away everything collected; now the progress is written out and the walk parks
         // until you are back in, then picks up at the entry it was on.
@@ -292,6 +333,15 @@ public final class JournalScrape {
         if (!connected) {
             if (state != State.WAIT_RECONNECT) {
                 kicks++;
+                // The server said no. Slow down before trying the same pace again, and remember it
+                // so the next run does not have to relearn the same lesson.
+                if (paceTicks < paceCeiling) {
+                    paceTicks = Math.min(paceCeiling, Math.max(10, paceTicks * 2));
+                    savePace(paceTicks);
+                    say(Component.literal(String.format("slowing to %.1fs between entries",
+                                    paceTicks / 20.0))
+                            .withStyle(ChatFormatting.YELLOW));
+                }
                 abandonEntryInProgress();
                 save(false);
                 say(Component.literal("disconnected - " + entries.size()
@@ -445,12 +495,16 @@ public final class JournalScrape {
                     // 0 and page 1 after every kick. The mismatch path is still there if the server
                     // does put us somewhere else.
                     steps = 0;
-                    state = State.REOPEN;
+                    reopen();
                 }
             }
             case REOPEN -> {
+                // The grid check comes FIRST: the gap exists to space out COMMANDS, so when the
+                // journal is already open there is nothing to space out and nothing to wait for.
                 if (gridOpen(mc)) {
                     state = State.OPEN_ENTRY;
+                } else if (paceLeft > 0) {
+                    paceLeft--;                       // the gap that keeps the server calm
                 } else if (mc.getConnection() == null) {
                     state = State.WAIT_RECONNECT;   // unreachable in practice: tick() catches a
                     wait = REJOIN_SETTLE;           // dropped connection first. Defensive only.
@@ -519,7 +573,7 @@ public final class JournalScrape {
         say(Component.literal("tab " + (tabIndex + 1) + "/" + tabs.length + ": " + tabNames[tabIndex]
                         + " (" + entries.size() + " entries so far)").withStyle(ChatFormatting.DARK_GRAY));
         save(false);
-        state = gridOpen(mc) ? State.CLICK_TAB : State.REOPEN;
+        if (gridOpen(mc)) { state = State.CLICK_TAB; } else { reopen(); }
     }
 
     private static String currentTabName() {
@@ -663,7 +717,7 @@ public final class JournalScrape {
         }
         final AbstractContainerScreen<?> g = grid(mc);
         if (g == null) {
-            state = State.REOPEN;
+            reopen();
             return;
         }
         final int slot = ENTRY_SLOTS[slotIndex];
@@ -779,7 +833,7 @@ public final class JournalScrape {
         }
         slotIndex++;
         mc.setScreenAndShow(null);
-        state = State.REOPEN;
+        reopen();
     }
 
     private static Path libraryFile() {
@@ -825,6 +879,70 @@ public final class JournalScrape {
         } catch (NumberFormatException e) {
             return -1;
         }
+    }
+
+    /** Go back for the grid, paying the anti-spam gap on the way. */
+    private static void reopen() {
+        paceLeft = paceTicks;
+        state = State.REOPEN;
+    }
+
+    /** Ends a run early but cleanly: what is collected is written, reported and uploadable. */
+    private static void stopRun(Minecraft mc, String why) {
+        mc.setScreenAndShow(null);
+        abandonEntryInProgress();
+        say(Component.literal(why + " - " + entries.size() + " entries this run")
+                .withStyle(ChatFormatting.YELLOW));
+        finish(mc);
+    }
+
+    private static boolean isKeyHeld(Minecraft mc, int key) {
+        try {
+            return InputConstants.isKeyDown(mc.getWindow(), key);
+        } catch (Exception e) {
+            return false;                          // no window, no keyboard, no stop key
+        }
+    }
+
+    /** "k", "end", "left.shift" - whatever the config names, resolved to a GLFW code. */
+    private static int keyCode(String name) {
+        final String n = name.trim().toLowerCase();
+        if (n.isEmpty() || n.equals("none") || n.equals("off")) {
+            return 0;
+        }
+        try {
+            return InputConstants.getKey(n.startsWith("key.") ? n : "key.keyboard." + n).getValue();
+        } catch (Exception e) {
+            say(Component.literal("stop-key '" + name + "' is not a key name; using K")
+                    .withStyle(ChatFormatting.YELLOW));
+            return InputConstants.getKey("key.keyboard.k").getValue();
+        }
+    }
+
+    /** The pace that survived last time, so a kick is a lesson learned once. */
+    private static int loadPace(int fallback) {
+        try {
+            final Path f = paceFile();
+            if (Files.isRegularFile(f)) {
+                return Math.max(fallback, Integer.parseInt(Files.readString(f).trim()));
+            }
+        } catch (Exception e) {
+            // an unreadable note just means starting from the configured pace
+        }
+        return fallback;
+    }
+
+    private static void savePace(int ticks) {
+        try {
+            Files.createDirectories(paceFile().getParent());
+            Files.writeString(paceFile(), Integer.toString(ticks));
+        } catch (IOException e) {
+            // losing the note costs one relearn, nothing more
+        }
+    }
+
+    private static Path paceFile() {
+        return Minecraft.getInstance().gameDirectory.toPath().resolve(MOD_ID).resolve("pace.txt");
     }
 
     private static void loadLibrary() {
@@ -903,7 +1021,9 @@ public final class JournalScrape {
         mc.setScreenAndShow(null);
         final Path file = outFile;
         final Path dir = file.getParent();
-        if (!save(true)) {
+        // A stopped run is not a finished one, and the file should not claim otherwise: `complete`
+        // is what tells a reader whether the journal in here is all of it.
+        if (!save(!stopping)) {
             state = State.IDLE;
             return;
         }
@@ -938,6 +1058,10 @@ public final class JournalScrape {
                             + "never overwrites a fuller one.")))));
         }
         say(line);
+        if (stopping) {
+            say(Component.literal("run /journal again to carry on - what is collected is not re-read")
+                    .withStyle(ChatFormatting.GRAY));
+        }
         state = State.IDLE;
     }
 

@@ -88,6 +88,23 @@ final class Uploader {
                 # your IP address like any web request. Set known-url=off to stop it and always
                 # scrape everything; it is otherwise derived from upload-url.
 
+                # PACING. Reading an entry closes the journal, so the walk re-issues /journal
+                # once per entry; sent flat out that reads as command spam and servers kick for it.
+                # entry-delay-ticks is the gap before each of those commands (20 ticks = 1s), and
+                # the gap DOUBLES after every disconnect, up to the maximum, so a run teaches
+                # itself a pace the server tolerates. The learned value is remembered for next
+                # time. 0 sends as fast as possible, which is what earned the kicks.
+                #
+                # A long run does not have to be finished in one sitting: press the stop key to
+                # end it cleanly, or set max-minutes to stop on a timer. Either way the file is
+                # written and can be uploaded, and running /journal again carries on rather than
+                # starting over - entries already collected are not re-read.
+
+                entry-delay-ticks=20
+                max-entry-delay-ticks=80
+                stop-key=k
+                max-minutes=0
+
                 upload-url=
                 upload-token=
                 known-url=
@@ -147,6 +164,20 @@ final class Uploader {
             return root.has("tiers") ? root.getAsJsonObject("tiers") : null;
         } catch (Exception e) {
             return null;                          // no index just means nothing gets skipped
+        }
+    }
+
+    /** One setting from the shared config file, for callers that are not about uploading. */
+    static String setting(String key, String fallback) {
+        final String v = config().getOrDefault(key, "");
+        return v.isBlank() ? fallback : v;
+    }
+
+    static int setting(String key, int fallback) {
+        try {
+            return Integer.parseInt(setting(key, Integer.toString(fallback)).trim());
+        } catch (NumberFormatException e) {
+            return fallback;
         }
     }
 
