@@ -90,19 +90,23 @@ final class Uploader {
 
                 # PACING. Reading an entry closes the journal, so the walk re-issues /journal
                 # once per entry; sent flat out that reads as command spam and servers kick for it.
-                # entry-delay-ticks is the gap before each of those commands (20 ticks = 1s), and
-                # the gap DOUBLES after every disconnect, up to the maximum, so a run teaches
-                # itself a pace the server tolerates. The learned value is remembered for next
-                # time. 0 sends as fast as possible, which is what earned the kicks.
+                # Rather than slowing every single entry down, the walk runs at full speed in
+                # bursts and takes a breath between them: pause-seconds after every pause-every
+                # entries. The pause grows by pause-step-seconds after each disconnect, up to
+                # max-pause-seconds, and the value that worked is remembered for next time.
+                # pause-every=0 turns pausing off, which is what earned the kicks.
                 #
-                # A long run does not have to be finished in one sitting: press the stop key to
-                # end it cleanly, or set max-minutes to stop on a timer. Either way the file is
-                # written and can be uploaded, and running /journal again carries on rather than
-                # starting over - entries already collected are not re-read.
+                # A long run does not have to be finished in one sitting: press ESCAPE to end it
+                # cleanly, or set max-minutes to stop on a timer. Either way the file is written
+                # and can be uploaded, and running /journal again carries on rather than starting
+                # over - entries already collected are not re-read. stop-key names an ADDITIONAL
+                # key if you want one; Escape always works.
 
-                entry-delay-ticks=20
-                max-entry-delay-ticks=80
-                stop-key=k
+                pause-every=10
+                pause-seconds=3
+                pause-step-seconds=1
+                max-pause-seconds=15
+                stop-key=none
                 max-minutes=0
 
                 upload-url=

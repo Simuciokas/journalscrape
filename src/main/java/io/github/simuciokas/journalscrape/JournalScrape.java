@@ -100,19 +100,23 @@ public final class JournalScrape {
     private static final int NAV_FIRST = 45;
     private static final int NAV_LAST = 53;
 
-    // THE REOPEN COMMAND IS PACED, AND THE PACE ADAPTS. The walk sends /journal once per entry;
-    // sent flat out that reads as command spam, and servers kick for it - which floods chat with
-    // join/leave messages and, on a journal of any size, makes the run slower than pacing would
-    // have been. So there is a gap before each reopen, and it DOUBLES on every disconnect up to a
-    // ceiling, so a run converges on a pace the server tolerates instead of fighting it. The value
-    // that worked is remembered for the next run.
+    // THE WALK PACES ITSELF IN BURSTS. It sends /journal once per entry; flat out that reads as
+    // command spam, and servers kick for it - which floods chat with join/leave messages and, on a
+    // journal of any size, ends up slower than pacing would have been. A gap before EVERY entry
+    // taxes the whole run to satisfy a limit that only bites in bursts, so instead the walk runs at
+    // full speed for a batch and then takes a breath: PAUSE_SECONDS after every PAUSE_EVERY
+    // entries. The pause grows after each disconnect, up to a ceiling, and the value that worked is
+    // remembered for the next run - a kick is a lesson learned once rather than every time.
     private static final int TIMEOUT = 60;             // waiting for a server-pushed screen
     private static final int SHORT_TIMEOUT = 20;       // "did anything change?" probe
     private static final int KNOWN_TIMEOUT = 120;      // 6s for the collector to answer
     private static final int MAX_PAGE_STEPS = 40;      // a book this long means something is wrong
     private static final int MAX_PAGES = 8;            // dialog pages within one entry
-    private static final int PACE_DEFAULT = 20;        // 1s before each reopen, unless configured
-    private static final int PACE_CEILING = 80;        // never crawl slower than 4s per entry
+    private static final int PAUSE_EVERY = 10;         // entries per burst
+    private static final int PAUSE_SECONDS = 3;        // breath between bursts
+    private static final int PAUSE_STEP = 1;           // added to the breath after a disconnect
+    private static final int PAUSE_MAX = 15;           // a breath this long means give up instead
+    private static final int ESCAPE_KEY = 256;
 
     private static final int[] ENTRY_SLOTS = buildEntrySlots();
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
@@ -138,12 +142,18 @@ public final class JournalScrape {
     private static final int REJOIN_SETTLE = 60;
 
     private static int commandsSent;
-    private static int paceTicks;              // gap before a reopen command, learned across runs
-    private static int paceCeiling;
+    private static int pauseEvery;             // entries per burst, 0 = never pause
+    private static int pauseTicks;             // length of the breath, learned across runs
+    private static int pauseStep;
+    private static int pauseMax;
+    private static int sinceBurst;             // entries opened since the last breath
     private static int paceLeft;               // ticks still to wait before the next reopen
-    private static int stopKey;                // held down to end a run cleanly, mid-walk
+    private static int stopKey;                // an ADDITIONAL key to end a run; Escape is built in
     private static long deadline;              // 0 = no time limit
     private static boolean stopping;
+    /** Set from the key handler, acted on by the next tick: stopping touches files and chat. */
+    private static volatile boolean stopRequested;
+    private static volatile String stopReason = "";
     private static int navAt;                  // page reached while navigating back to gridPage
     private static String pageMarker = "";     // fingerprint of the page being walked
     private static String lastFp = "";         // previous tick's fingerprint, to spot settling
@@ -256,11 +266,16 @@ public final class JournalScrape {
         currentKey = "";
         remoteTiers = null;
         remoteDone = false;
-        paceTicks = Math.max(0, Uploader.setting("entry-delay-ticks", PACE_DEFAULT));
-        paceCeiling = Math.max(paceTicks, Uploader.setting("max-entry-delay-ticks", PACE_CEILING));
-        paceTicks = Math.min(loadPace(paceTicks), paceCeiling);
+        pauseEvery = Math.max(0, Uploader.setting("pause-every", PAUSE_EVERY));
+        pauseStep = Math.max(0, Uploader.setting("pause-step-seconds", PAUSE_STEP)) * 20;
+        pauseMax = Math.max(1, Uploader.setting("max-pause-seconds", PAUSE_MAX)) * 20;
+        pauseTicks = Math.max(1, Uploader.setting("pause-seconds", PAUSE_SECONDS)) * 20;
+        pauseTicks = Math.min(Math.max(pauseTicks, loadPace(pauseTicks)), pauseMax);
+        sinceBurst = 0;
         paceLeft = 0;
-        stopKey = keyCode(Uploader.setting("stop-key", "k"));
+        stopRequested = false;
+        stopReason = "";
+        stopKey = keyCode(Uploader.setting("stop-key", "none"));
         final int budget = Math.max(0, Uploader.setting("max-minutes", 0));
         deadline = budget == 0 ? 0L : System.currentTimeMillis() + budget * 60_000L;
         stopping = false;
@@ -289,11 +304,11 @@ public final class JournalScrape {
                         : ("scraping up to " + limit + " entries"))
                         + " - leave the GUI alone; a kick will pause it, not end it")
                 .withStyle(ChatFormatting.GRAY));
-        say(Component.literal(String.format(
-                        "pacing %.1fs between entries%s - hold %s to stop and keep what is done",
-                        paceTicks / 20.0,
-                        deadline == 0 ? "" : (", stopping after " + budget + " min"),
-                        Uploader.setting("stop-key", "k").toUpperCase()))
+        say(Component.literal((pauseEvery == 0
+                        ? "no pacing - a kick is likely"
+                        : String.format("pausing %.0fs every %d entries", pauseTicks / 20.0, pauseEvery))
+                        + (deadline == 0 ? "" : (", stopping after " + budget + " min"))
+                        + " - press ESC to stop and keep what is done")
                 .withStyle(ChatFormatting.DARK_GRAY));
         return true;
     }
@@ -313,10 +328,15 @@ public final class JournalScrape {
         // not something to be trapped in. Either signal writes the file and reports it, and the next
         // run carries on from what is collected rather than starting over.
         if (!stopping && state != State.IDLE) {
+            if (stopRequested) {
+                stopping = true;
+                stopRun(mc, stopReason);
+                return;
+            }
             if (stopKey != 0 && isKeyHeld(mc, stopKey)) {
                 stopping = true;
                 stopRun(mc, "stopped on the "
-                        + Uploader.setting("stop-key", "k").toUpperCase() + " key");
+                        + Uploader.setting("stop-key", "none").toUpperCase() + " key");
                 return;
             }
             if (deadline != 0 && System.currentTimeMillis() > deadline) {
@@ -333,13 +353,13 @@ public final class JournalScrape {
         if (!connected) {
             if (state != State.WAIT_RECONNECT) {
                 kicks++;
-                // The server said no. Slow down before trying the same pace again, and remember it
+                // The server said no. Breathe for longer before the next burst, and remember it
                 // so the next run does not have to relearn the same lesson.
-                if (paceTicks < paceCeiling) {
-                    paceTicks = Math.min(paceCeiling, Math.max(10, paceTicks * 2));
-                    savePace(paceTicks);
-                    say(Component.literal(String.format("slowing to %.1fs between entries",
-                                    paceTicks / 20.0))
+                if (pauseStep > 0 && pauseTicks < pauseMax) {
+                    pauseTicks = Math.min(pauseMax, pauseTicks + pauseStep);
+                    savePace(pauseTicks);
+                    say(Component.literal(String.format("pausing %.0fs every %d entries from now on",
+                                    pauseTicks / 20.0, pauseEvery))
                             .withStyle(ChatFormatting.YELLOW));
                 }
                 abandonEntryInProgress();
@@ -881,10 +901,31 @@ public final class JournalScrape {
         }
     }
 
-    /** Go back for the grid, paying the anti-spam gap on the way. */
+    /**
+     * Go back for the grid, taking a breath once a burst is done.
+     *
+     * <p>Counted here rather than per entry because this is the path that sends a command: an entry
+     * copied forward from the library or skipped as already collected costs nothing and should not
+     * bring the pause any closer.
+     */
     private static void reopen() {
-        paceLeft = paceTicks;
+        paceLeft = 0;
+        if (pauseEvery > 0 && ++sinceBurst >= pauseEvery) {
+            sinceBurst = 0;
+            paceLeft = pauseTicks;
+        }
         state = State.REOPEN;
+    }
+
+    /**
+     * Escape ends a run. Called from the screen's key handler, so it only records the request - the
+     * stop itself writes files and prints chat, which belongs on the tick that follows.
+     */
+    public static void onKeyPressed(int key) {
+        if (key == ESCAPE_KEY && state != State.IDLE && !stopRequested) {
+            stopRequested = true;
+            stopReason = "stopped on Esc";
+        }
     }
 
     /** Ends a run early but cleanly: what is collected is written, reported and uploadable. */
@@ -919,7 +960,7 @@ public final class JournalScrape {
         }
     }
 
-    /** The pace that survived last time, so a kick is a lesson learned once. */
+    /** The pause that survived last time, so a kick is a lesson learned once. */
     private static int loadPace(int fallback) {
         try {
             final Path f = paceFile();

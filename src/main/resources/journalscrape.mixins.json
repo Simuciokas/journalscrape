@@ -5,7 +5,8 @@
   "client": [
     "ClientPacketListenerMixin",
     "DialogScreenAccessor",
-    "MinecraftMixin"
+    "MinecraftMixin",
+    "ScreenMixin"
   ],
   "injectors": {
     "defaultRequire": 1

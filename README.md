@@ -14,31 +14,40 @@ Region Filter, and pressing it would change what the journal shows rather than m
 
 **It survives a kick.** If the connection drops mid-walk - including because the server kicked you
 for the very commands this mod sends - the run is not lost: progress is written out immediately,
-the walk parks, and it resumes at the entry it was on once you are back in the world. There is
-no cancel command: the GUI is open for the whole run, so there would never be a moment to type
-one - disconnect or close the game if you need a run to stop. The output records `disconnects` and
-a `complete` flag, and partial results are saved every 10 entries anyway, so even a crash leaves a
-usable file.
+the walk parks, and it resumes at the entry it was on once you are back in the world. The output
+records `disconnects` and a `complete` flag, and partial results are saved every 10 entries anyway,
+so even a crash leaves a usable file.
 
-**It paces itself, and the pace adapts.** Reading an entry closes the grid, so the walk re-issues
-`/journal` once per entry. Sent flat out that reads as command spam and servers kick for it, which
-floods chat with join/leave messages and, on a journal of any size, ends up slower than pacing
-would have been. So there is a gap before each reopen - `entry-delay-ticks`, 1 second by default -
-and it **doubles after every disconnect** up to `max-entry-delay-ticks`, so a run converges on a
-pace the server tolerates instead of fighting it. The value that worked is remembered in
-`journalscrape/pace.txt`, so a kick is a lesson learned once rather than every run.
+**It paces itself in bursts, and the pace adapts.** Reading an entry closes the grid, so the walk
+re-issues `/journal` once per entry. Sent flat out that reads as command spam and servers kick for
+it, which floods chat with join/leave messages and, on a journal of any size, ends up slower than
+pacing would have been.
 
-The gap spaces out *commands*, so it is only paid for entries that actually get opened. A resumed
-run, or one where the collector already holds most entries, walks past them without waiting.
+A gap before *every* entry taxes the whole run to satisfy a limit that only bites in bursts, so
+instead the walk runs at full speed for a batch and then takes a breath: **3 seconds after every
+10 entries** (`pause-seconds`, `pause-every`). The breath grows by `pause-step-seconds` after each
+disconnect, up to `max-pause-seconds`, and the value that worked is remembered in
+`journalscrape/pace.txt` - a kick is a lesson learned once rather than every run.
+
+On a 600-entry journal that is about 3 minutes of pausing rather than the 10 a per-entry gap would
+have cost, and the server sees roughly 0.5 commands per second instead of a flat-out burst of
+hundreds.
+
+The pause is counted on the path that *sends a command*, so an entry copied forward from the
+library or skipped as already collected does not bring it any closer. A resumed run barely pauses
+at all.
 
 A kick is still not fatal: it pauses the walk and resumes at the entry it was on, and reopening the
 journal returns you to the page you were on, so a resume normally continues without re-navigating.
 
-**You can stop part-way.** A journal with hundreds of entries is not something to be trapped in.
-Hold the stop key - `K` by default, `stop-key` in the config, `none` to disable - or set
-`max-minutes` to stop on a timer. Either way the file is written and reported with its `[upload]`
-button, marked `"complete": false`, and running `/journal` again carries on: entries already
-collected are not re-read.
+**Escape stops it.** A journal with hundreds of entries is not something to be trapped in, and
+closing the window is what a player reaches for - so `Esc` ends the run rather than being fought.
+Without that the walk sees the grid gone, re-issues the command and the journal opens again, which
+is indistinguishable from being stuck.
+
+The file is written and reported with its `[upload]` button, marked `"complete": false`, and
+running `/journal` again carries on: entries already collected are not re-read. `max-minutes`
+stops on a timer instead, and `stop-key` names an additional key if you want one.
 
 ## It only opens what it might learn from
 
@@ -115,9 +124,11 @@ to whatever collector you have configured. Nothing is ever sent without that cli
 `config/journalscrape.txt` is written on first launch:
 
 ```
-entry-delay-ticks=20          # gap before each /journal reopen; 0 is as fast as possible
-max-entry-delay-ticks=80      # ceiling the doubling backs off to
-stop-key=k                    # hold to end a run early; "none" to disable
+pause-every=10                # entries per burst before it takes a breath; 0 = never pause
+pause-seconds=3               # how long the breath is
+pause-step-seconds=1          # added to it after each disconnect
+max-pause-seconds=15          # ceiling for that growth
+stop-key=none                 # an ADDITIONAL stop key; Escape always works
 max-minutes=0                 # stop on a timer; 0 for no limit
 
 upload-url=https://your-collector.example/api/upload
@@ -250,15 +261,14 @@ Working. A full run has completed end to end against a live journal - 279 entrie
 tab walking, tier-diffed incremental runs and the tooltip capture all exercised.
 
 **Not yet exercised in game:** the collector index check (`GET /api/known`) that skips entries
-other players have already read, and the pacing/stop work in 1.1.0. The index's ranking rules are
-tested against a real index and its fetch fails open; the pacing compiles and is reviewed but no
-live run has used either yet.
+other players have already read, and the pacing and stop handling. The index's ranking rules are
+tested against a real index and its fetch fails open; the pacing and the Escape hook compile, and
+every mixin target is verified against the client jar, but no live run has used them yet.
 
 The pacing exists because of feedback from a player with a far larger journal than mine: flat out
 it kicked him repeatedly, flooded chat with join/leave messages, and had not finished the first
-category after 600 entries. The adaptive gap, the stop key and the timer are the answer to that.
-The defaults are deliberately cautious - `entry-delay-ticks=0` restores the old behaviour on a
-server that does not mind.
+category after 600 entries. The burst pacing, Escape and the timer are the answer to that.
+`pause-every=0` turns pausing off again on a server that does not mind.
 
 ## License
 
