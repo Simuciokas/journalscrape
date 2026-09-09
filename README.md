@@ -51,6 +51,14 @@ frames between windows, where no screen exists at all, and the HUD pass draws un
 that is open. The cover is cosmetic only: Escape still reaches the screen beneath it. `overlay=false`
 shows the raw windows instead.
 
+The bar runs across the whole walk and only ever moves forward. Its total comes from the LIBRARY -
+what previous runs found - which is the only honest estimate available, since the real total is not
+known until a walk has finished once; a run that unlocks something new pushes past that total, so
+the total grows with it rather than pinning the bar at full while work continues. Tab boundaries are
+drawn onto the bar as ticks, so where a category ends is still visible without the bar restarting
+there. With no library at all - a genuine first run - there is nothing to count against, so the bar
+falls back to tabs completed: coarse, but it does reach the end.
+
 **Escape stops it.** A journal with hundreds of entries is not something to be trapped in, and
 closing the window is what a player reaches for - so `Esc` ends the run rather than being fought.
 Without that the walk sees the grid gone, re-issues the command and the journal opens again, which

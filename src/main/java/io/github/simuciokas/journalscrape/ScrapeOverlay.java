@@ -80,15 +80,23 @@ public final class ScrapeOverlay {
         g.centeredText(font, title, x + boxW / 2, ty, TITLE);
         ty += lineH + 4;
 
-        // progress bar: an estimate against the library's size, since the true total is only known
-        // once a walk finishes. Indeterminate on a first run, where there is nothing to compare to.
+        // PROGRESS BAR. Runs across the whole walk, not per tab: a bar that restarts is not a
+        // progress bar. The tab boundaries are drawn onto it as ticks instead, so the structure the
+        // old per-tab bar was conveying is still visible without the reset.
         final float p = JournalScrape.overlayProgress();
         final int barX = x + padding;
         final int barW = boxW - padding * 2;
         g.fill(barX, ty, barX + barW, ty + barH, LINE);
-        if (p >= 0) {
-            final int filled = Math.max(1, Math.round(barW * Math.min(1f, p)));
+        final int filled = Math.round(barW * Math.min(1f, Math.max(0f, p)));
+        if (filled > 0) {
             g.fill(barX, ty, barX + filled, ty + barH, ACCENT);
+        }
+        // Ticks last, so they stay legible over the filled part as well as the empty part.
+        for (float mark : JournalScrape.overlayTabMarks()) {
+            final int mx = barX + Math.round(barW * mark);
+            if (mx > barX && mx < barX + barW) {
+                g.fill(mx - 1, ty, mx, ty + barH, PANEL);
+            }
         }
         ty += barH + 8;
 

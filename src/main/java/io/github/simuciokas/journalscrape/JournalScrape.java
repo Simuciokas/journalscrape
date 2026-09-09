@@ -180,6 +180,19 @@ public final class JournalScrape {
     private static int reused;
     private static int refreshed;
     private static int skipped;                // already known to the collector, never opened
+    /**
+     * Entries the walk has passed this run, however it passed them - read, copied forward, or
+     * skipped as already collected.
+     *
+     * <p>SEPARATE FROM `seen` ON PURPOSE. `seen` is the page-overlap de-duplicator and is CLEARED
+     * at every tab boundary, because the overlap it guards against is between pages of one
+     * category; using it for progress made the bar restart at every tab. This one only ever goes
+     * up, which is the only thing a progress bar may do.
+     */
+    private static int walked;
+    /** Entries the library says exist, per tab in walk order, for the bar's total and its ticks. */
+    private static int[] tabExpected = new int[0];
+    private static int expectedTotal;
     private static int kicks;
     private static JsonObject currentEntry;
     private static JsonArray entries;
@@ -265,6 +278,9 @@ public final class JournalScrape {
         reused = 0;
         refreshed = 0;
         skipped = 0;
+        walked = 0;
+        tabExpected = new int[0];
+        expectedTotal = 0;
         currentKey = "";
         remoteTiers = null;
         remoteDone = false;
@@ -283,6 +299,7 @@ public final class JournalScrape {
         deadline = budget == 0 ? 0L : System.currentTimeMillis() + budget * 60_000L;
         stopping = false;
         loadLibrary();
+        expectedTotal = library.size();
         startedAt = System.currentTimeMillis();
         // Chosen up front so every partial save through the run lands in the same file.
         outFile = Minecraft.getInstance().gameDirectory.toPath().resolve(MOD_ID)
@@ -404,6 +421,7 @@ public final class JournalScrape {
                         }
                         say(Component.literal("found " + tabs.length + " tabs: "
                                         + String.join(", ", tabNames)).withStyle(ChatFormatting.DARK_GRAY));
+                        countExpectedPerTab();
                     }
                     state = State.CLICK_TAB;
                 } else if (--wait <= 0) {
@@ -773,6 +791,7 @@ public final class JournalScrape {
             entries.add(known);
             seen.add(key);
             reused++;
+            walked++;
             slotIndex++;
             return;
         }
@@ -783,6 +802,7 @@ public final class JournalScrape {
         if (!force && covered(key, tier)) {
             seen.add(key);
             skipped++;
+            walked++;
             slotIndex++;
             return;
         }
@@ -846,6 +866,7 @@ public final class JournalScrape {
             if (!currentKey.isEmpty()) {
                 library.put(currentKey, currentEntry);
                 seen.add(currentKey);
+                walked++;
                 currentKey = "";
             }
             currentEntry = null;
@@ -920,24 +941,67 @@ public final class JournalScrape {
         state = State.REOPEN;
     }
 
+    /**
+     * How many entries the library holds for each discovered tab, in walk order.
+     *
+     * <p>Used for the progress bar's tick marks, so one continuous bar can still show where the
+     * tab boundaries fall - the structure the old per-tab bar was conveying by resetting.
+     */
+    private static void countExpectedPerTab() {
+        tabExpected = new int[tabs.length];
+        for (JsonObject e : library.values()) {
+            if (!e.has("tab")) {
+                continue;
+            }
+            final String tab = e.get("tab").getAsString();
+            for (int i = 0; i < tabNames.length; i++) {
+                if (tabNames[i].equals(tab)) {
+                    tabExpected[i]++;
+                    break;
+                }
+            }
+        }
+    }
+
+    /** Cumulative fractions of the total at each tab boundary, or an empty array when unknown. */
+    public static float[] overlayTabMarks() {
+        if (expectedTotal <= 0 || tabExpected.length == 0) {
+            return new float[0];
+        }
+        final float[] out = new float[tabExpected.length];
+        int running = 0;
+        for (int i = 0; i < tabExpected.length; i++) {
+            running += tabExpected[i];
+            out[i] = Math.min(1f, running / (float) Math.max(expectedTotal, walked));
+        }
+        return out;
+    }
+
     /** True while a walk is in progress AND the cover is wanted - the overlay's only gate. */
     public static boolean isRunning() {
         return overlay && state != State.IDLE;
     }
 
     /**
-     * Progress as a fraction, or -1 when it cannot be known.
+     * Progress as a fraction, 0..1.
      *
-     * <p>Estimated against the LIBRARY's size, because the real total only becomes known once a
-     * walk has finished once. On a first run there is nothing to compare against, so the bar is
-     * left indeterminate rather than invented.
+     * <p>The numerator is `walked`, which never decreases. The denominator is what the library says
+     * exists - and is GROWN when the walk passes more entries than that, since a run that unlocks
+     * something new legitimately exceeds the old total and a bar must not sit pinned at full while
+     * work continues.
+     *
+     * <p>With no library at all - a genuine first run - there is no entry count to work from, so
+     * the bar falls back to TAB progress. That is coarse, but it is honest and it still reaches the
+     * end, which the old estimate could not: it divided by a total it had no basis for.
      */
     public static float overlayProgress() {
-        final int total = library.size();
-        if (total <= 0) {
-            return -1f;
+        if (expectedTotal > 0) {
+            return Math.min(1f, walked / (float) Math.max(expectedTotal, walked));
         }
-        return Math.min(1f, seen.size() / (float) total);
+        if (tabs.length > 0) {
+            return Math.min(1f, tabIndex / (float) tabs.length);
+        }
+        return 0f;
     }
 
     /** The lines the cover shows. Kept short: this is read at a glance, mid-run. */
@@ -952,9 +1016,9 @@ public final class JournalScrape {
             out.add(entries.size() + " entries saved so far; the walk resumes on its own");
             return out;
         }
-        final int total = library.size();
-        final String of = total > 0 ? (" of ~" + total) : "";
-        out.add("entry " + seen.size() + of
+        final int total = Math.max(expectedTotal, walked);
+        final String of = expectedTotal > 0 ? (" of " + (walked > expectedTotal ? "" : "~") + total) : "";
+        out.add("entry " + walked + of
                 + (tabs.length > 0 ? ("   tab " + Math.min(tabIndex + 1, tabs.length)
                                       + "/" + tabs.length) : "")
                 + "   page " + (gridPage + 1));
