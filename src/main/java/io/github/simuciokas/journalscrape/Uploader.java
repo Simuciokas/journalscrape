@@ -102,6 +102,13 @@ final class Uploader {
                 # over - entries already collected are not re-read. stop-key names an ADDITIONAL
                 # key if you want one; Escape always works.
 
+                # The walk opens and closes a window several times a second, which flashes for
+                # the whole run - unpleasant to watch and unsafe for anyone photosensitive. So the
+                # screen is covered with a still panel showing the progress. overlay=false shows the
+                # raw windows instead.
+
+                overlay=true
+
                 pause-every=10
                 pause-seconds=3
                 pause-step-seconds=1

@@ -153,6 +153,8 @@ public final class JournalScrape {
     private static boolean stopping;
     /** Set from the key handler, acted on by the next tick: stopping touches files and chat. */
     private static volatile boolean stopRequested;
+    /** Cover the screen while the walk runs? See ScrapeOverlay for why this defaults to on. */
+    private static volatile boolean overlay = true;
     private static volatile String stopReason = "";
     private static int navAt;                  // page reached while navigating back to gridPage
     private static String pageMarker = "";     // fingerprint of the page being walked
@@ -276,6 +278,7 @@ public final class JournalScrape {
         stopRequested = false;
         stopReason = "";
         stopKey = keyCode(Uploader.setting("stop-key", "none"));
+        overlay = !Uploader.setting("overlay", "true").equalsIgnoreCase("false");
         final int budget = Math.max(0, Uploader.setting("max-minutes", 0));
         deadline = budget == 0 ? 0L : System.currentTimeMillis() + budget * 60_000L;
         stopping = false;
@@ -915,6 +918,52 @@ public final class JournalScrape {
             paceLeft = pauseTicks;
         }
         state = State.REOPEN;
+    }
+
+    /** True while a walk is in progress AND the cover is wanted - the overlay's only gate. */
+    public static boolean isRunning() {
+        return overlay && state != State.IDLE;
+    }
+
+    /**
+     * Progress as a fraction, or -1 when it cannot be known.
+     *
+     * <p>Estimated against the LIBRARY's size, because the real total only becomes known once a
+     * walk has finished once. On a first run there is nothing to compare against, so the bar is
+     * left indeterminate rather than invented.
+     */
+    public static float overlayProgress() {
+        final int total = library.size();
+        if (total <= 0) {
+            return -1f;
+        }
+        return Math.min(1f, seen.size() / (float) total);
+    }
+
+    /** The lines the cover shows. Kept short: this is read at a glance, mid-run. */
+    public static List<String> overlayLines() {
+        final List<String> out = new ArrayList<>(4);
+        if (state == State.WAIT_KNOWN) {
+            out.add("asking the collector what it already knows");
+            return out;
+        }
+        if (state == State.WAIT_RECONNECT) {
+            out.add("disconnected - waiting to rejoin");
+            out.add(entries.size() + " entries saved so far; the walk resumes on its own");
+            return out;
+        }
+        final int total = library.size();
+        final String of = total > 0 ? (" of ~" + total) : "";
+        out.add("entry " + seen.size() + of
+                + (tabs.length > 0 ? ("   tab " + Math.min(tabIndex + 1, tabs.length)
+                                      + "/" + tabs.length) : "")
+                + "   page " + (gridPage + 1));
+        out.add(refreshed + " read   " + reused + " unchanged   " + skipped + " already collected");
+        final long secs = (System.currentTimeMillis() - startedAt) / 1000L;
+        out.add(String.format("%d:%02d elapsed%s", secs / 60, secs % 60,
+                              kicks == 0 ? "" : ("   " + kicks + " disconnect"
+                                                 + (kicks == 1 ? "" : "s") + " survived")));
+        return out;
     }
 
     /**

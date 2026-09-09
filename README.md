@@ -40,6 +40,17 @@ at all.
 A kick is still not fatal: it pauses the walk and resumes at the entry it was on, and reopening the
 journal returns you to the page you were on, so a resume normally continues without re-navigating.
 
+**The screen is covered while it runs.** The walk opens and closes a window several times a second
+for the whole run, and that flashing is unpleasant to watch and genuinely unsafe for anyone
+photosensitive - a large journal means minutes of it. So the mod paints over its own work: a still,
+opaque panel showing the progress, the counts, the elapsed time and `[Esc]` as the way out. Nothing
+on the panel animates faster than once a second.
+
+It is drawn from two hooks because neither covers the whole cycle alone - the screen pass misses the
+frames between windows, where no screen exists at all, and the HUD pass draws underneath any screen
+that is open. The cover is cosmetic only: Escape still reaches the screen beneath it. `overlay=false`
+shows the raw windows instead.
+
 **Escape stops it.** A journal with hundreds of entries is not something to be trapped in, and
 closing the window is what a player reaches for - so `Esc` ends the run rather than being fought.
 Without that the walk sees the grid gone, re-issues the command and the journal opens again, which
@@ -124,6 +135,7 @@ to whatever collector you have configured. Nothing is ever sent without that cli
 `config/journalscrape.txt` is written on first launch:
 
 ```
+overlay=true                  # cover the flashing windows with a progress panel
 pause-every=10                # entries per burst before it takes a breath; 0 = never pause
 pause-seconds=3               # how long the breath is
 pause-step-seconds=1          # added to it after each disconnect
@@ -261,9 +273,10 @@ Working. A full run has completed end to end against a live journal - 279 entrie
 tab walking, tier-diffed incremental runs and the tooltip capture all exercised.
 
 **Not yet exercised in game:** the collector index check (`GET /api/known`) that skips entries
-other players have already read, and the pacing and stop handling. The index's ranking rules are
-tested against a real index and its fetch fails open; the pacing and the Escape hook compile, and
-every mixin target is verified against the client jar, but no live run has used them yet.
+other players have already read, the pacing and stop handling, and the overlay. The index's ranking
+rules are tested against a real index and its fetch fails open; the pacing, the Escape hook and both
+overlay hooks compile, and every mixin target and descriptor is verified against the 26.2 client jar,
+but no live run has used them yet.
 
 The pacing exists because of feedback from a player with a far larger journal than mine: flat out
 it kicked him repeatedly, flooded chat with join/leave messages, and had not finished the first

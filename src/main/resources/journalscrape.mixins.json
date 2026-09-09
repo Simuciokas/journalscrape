@@ -6,7 +6,9 @@
     "ClientPacketListenerMixin",
     "DialogScreenAccessor",
     "MinecraftMixin",
-    "ScreenMixin"
+    "ScreenMixin",
+    "HudOverlayMixin",
+    "ScreenOverlayMixin"
   ],
   "injectors": {
     "defaultRequire": 1
