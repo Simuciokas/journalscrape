@@ -52,12 +52,20 @@ that is open. The cover is cosmetic only: Escape still reaches the screen beneat
 shows the raw windows instead.
 
 The bar runs across the whole walk and only ever moves forward. Its total comes from the LIBRARY -
-what previous runs found - which is the only honest estimate available, since the real total is not
-known until a walk has finished once; a run that unlocks something new pushes past that total, so
-the total grows with it rather than pinning the bar at full while work continues. Tab boundaries are
-drawn onto the bar as ticks, so where a category ends is still visible without the bar restarting
-there. With no library at all - a genuine first run - there is nothing to count against, so the bar
-falls back to tabs completed: coarse, but it does reach the end.
+what previous runs found - which is the only estimate available, since the real total is not known
+until a walk has finished once. Tab boundaries are drawn onto it as ticks, so where a category ends
+is still visible without the bar restarting there.
+
+A journal holding MORE than the library is the normal case: anything unlocked since the last run is
+new. The estimate is therefore kept per tab, and an overshoot is charged to the tab it happens in -
+a tab being walked is worth at least what the library says and at least what it has produced, a
+finished tab is worth exactly what it produced, and tabs not yet reached are worth what the library
+says. So the tab that runs long pushes its own tick to the right and the bar keeps moving, rather
+than the run-wide total being overtaken and the bar reading full for the rest of the walk. The one
+case that cannot be smoothed is an overshoot in the LAST tab, where there is nothing after it to
+reserve room from: the bar sits at full for that tail. With no library at all - a genuine first run
+- there is nothing to count against, so it falls back to tabs completed: coarse, but it reaches the
+end.
 
 **Escape stops it.** A journal with hundreds of entries is not something to be trapped in, and
 closing the window is what a player reaches for - so `Esc` ends the run rather than being fought.

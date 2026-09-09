@@ -192,7 +192,17 @@ public final class JournalScrape {
     private static int walked;
     /** Entries the library says exist, per tab in walk order, for the bar's total and its ticks. */
     private static int[] tabExpected = new int[0];
+    /** Entries actually passed, per tab - so an overshoot is charged to the tab that caused it. */
+    private static int[] tabWalked = new int[0];
     private static int expectedTotal;
+
+    /** One entry passed, however it was passed. The bar's numerator, and nothing else's. */
+    private static void passed() {
+        walked++;
+        if (tabIndex >= 0 && tabIndex < tabWalked.length) {
+            tabWalked[tabIndex]++;
+        }
+    }
     private static int kicks;
     private static JsonObject currentEntry;
     private static JsonArray entries;
@@ -791,7 +801,7 @@ public final class JournalScrape {
             entries.add(known);
             seen.add(key);
             reused++;
-            walked++;
+            passed();
             slotIndex++;
             return;
         }
@@ -802,7 +812,7 @@ public final class JournalScrape {
         if (!force && covered(key, tier)) {
             seen.add(key);
             skipped++;
-            walked++;
+            passed();
             slotIndex++;
             return;
         }
@@ -866,7 +876,7 @@ public final class JournalScrape {
             if (!currentKey.isEmpty()) {
                 library.put(currentKey, currentEntry);
                 seen.add(currentKey);
-                walked++;
+                passed();
                 currentKey = "";
             }
             currentEntry = null;
@@ -949,6 +959,7 @@ public final class JournalScrape {
      */
     private static void countExpectedPerTab() {
         tabExpected = new int[tabs.length];
+        tabWalked = new int[tabs.length];
         for (JsonObject e : library.values()) {
             if (!e.has("tab")) {
                 continue;
@@ -963,16 +974,53 @@ public final class JournalScrape {
         }
     }
 
+    /**
+     * The denominator for the bar: how many entries this walk now looks like it will pass.
+     *
+     * <p>MORE IN THE JOURNAL THAN IN THE LIBRARY IS NORMAL - anything unlocked since the last run is
+     * new, and a first run has no library at all. So the estimate is per tab, and the overshoot is
+     * charged to the TAB IT HAPPENS IN rather than to the run: a tab still being walked is worth at
+     * least what the library says and at least what it has actually produced, a tab already finished
+     * is worth exactly what it produced, and tabs not yet reached are worth what the library says.
+     *
+     * <p>That is what keeps the bar moving through an overshoot. Growing ONE RUN-WIDE total instead
+     * makes the numerator and the denominator the same number from the moment the walk passes the
+     * old total until the run ends - so the bar reads full over a stretch as long as the overshoot
+     * itself, which with a thin library is most of the run. Charging it per tab confines that to the
+     * tab it happens in, and to nothing at all unless it happens in the last one.
+     *
+     * <p>It can only ever move the bar FORWARD. Mid-tab an overshoot adds one to both halves of a
+     * fraction below one, which raises it; at a tab boundary the estimate is replaced by the actual,
+     * which is never larger.
+     */
+    private static int estimatedTotal() {
+        if (tabExpected.length == 0 || tabExpected.length != tabWalked.length) {
+            return Math.max(expectedTotal, walked);       // tabs not discovered yet
+        }
+        int total = 0;
+        for (int i = 0; i < tabExpected.length; i++) {
+            total += (i < tabIndex) ? tabWalked[i] : Math.max(tabExpected[i], tabWalked[i]);
+        }
+        return Math.max(total, walked);
+    }
+
     /** Cumulative fractions of the total at each tab boundary, or an empty array when unknown. */
     public static float[] overlayTabMarks() {
-        if (expectedTotal <= 0 || tabExpected.length == 0) {
+        if (expectedTotal <= 0 || tabExpected.length == 0 || tabExpected.length != tabWalked.length) {
+            return new float[0];
+        }
+        final int total = estimatedTotal();
+        if (total <= 0) {
             return new float[0];
         }
         final float[] out = new float[tabExpected.length];
         int running = 0;
         for (int i = 0; i < tabExpected.length; i++) {
-            running += tabExpected[i];
-            out[i] = Math.min(1f, running / (float) Math.max(expectedTotal, walked));
+            // Each tick sits where that tab is now expected to END, on the same estimate the fill
+            // uses - so a tab that runs long pushes its own tick and the ones after it to the right
+            // instead of the fill sliding out from under them.
+            running += (i < tabIndex) ? tabWalked[i] : Math.max(tabExpected[i], tabWalked[i]);
+            out[i] = Math.min(1f, running / (float) total);
         }
         return out;
     }
@@ -985,10 +1033,9 @@ public final class JournalScrape {
     /**
      * Progress as a fraction, 0..1.
      *
-     * <p>The numerator is `walked`, which never decreases. The denominator is what the library says
-     * exists - and is GROWN when the walk passes more entries than that, since a run that unlocks
-     * something new legitimately exceeds the old total and a bar must not sit pinned at full while
-     * work continues.
+     * <p>The numerator is `walked`, which never decreases; the denominator is
+     * {@link #estimatedTotal()}, which absorbs an overshoot per tab so the bar keeps moving when the
+     * journal holds more than the last run found.
      *
      * <p>With no library at all - a genuine first run - there is no entry count to work from, so
      * the bar falls back to TAB progress. That is coarse, but it is honest and it still reaches the
@@ -996,7 +1043,8 @@ public final class JournalScrape {
      */
     public static float overlayProgress() {
         if (expectedTotal > 0) {
-            return Math.min(1f, walked / (float) Math.max(expectedTotal, walked));
+            final int total = estimatedTotal();
+            return total > 0 ? Math.min(1f, walked / (float) total) : 0f;
         }
         if (tabs.length > 0) {
             return Math.min(1f, tabIndex / (float) tabs.length);
@@ -1016,8 +1064,8 @@ public final class JournalScrape {
             out.add(entries.size() + " entries saved so far; the walk resumes on its own");
             return out;
         }
-        final int total = Math.max(expectedTotal, walked);
-        final String of = expectedTotal > 0 ? (" of " + (walked > expectedTotal ? "" : "~") + total) : "";
+        final int total = estimatedTotal();
+        final String of = expectedTotal > 0 ? (" of ~" + total) : "";
         out.add("entry " + walked + of
                 + (tabs.length > 0 ? ("   tab " + Math.min(tabIndex + 1, tabs.length)
                                       + "/" + tabs.length) : "")
