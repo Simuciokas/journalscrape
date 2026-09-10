@@ -216,8 +216,10 @@ and nothing at all is then sent before you click.
 **Where it goes is your choice, but it has a default.** A released build points at the collector
 behind [faceland.simuciokas.uk](https://faceland.simuciokas.uk); put your own URL in the config to
 send somewhere else, or `off` to send nowhere. Anything you upload is then in the hands of whoever
-runs that collector, so it is worth knowing that this one serves the merged result as a public web
-page - your in-game name is not published on it, but the entries you contributed are.
+runs that collector, so it is worth knowing what this one does with an upload: it serves the merged
+result as a public web page, and **credits contributors on it by in-game name** - each entry lists
+who first unlocked each of its pages, and when. If you would rather not appear there, do not upload;
+the scrape is yours until you click.
 
 The two endpoints a collector has to provide:
 
