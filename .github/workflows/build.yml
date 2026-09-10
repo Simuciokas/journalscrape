@@ -32,7 +32,15 @@ jobs:
           path: build/minecraft
           key: mc-${{ hashFiles('gradle.properties') }}
 
+      # The collector URL and token are baked into the jar from these, so a released build works
+      # for someone who just installed it. They are repo secrets rather than committed values: the
+      # token is public once a jar ships either way, but a jar can be replaced by the next release
+      # and git history cannot, so this keeps rotating it possible. A fork without the secrets set
+      # builds fine and simply has no default collector.
       - run: ./gradlew build
+        env:
+          JOURNALSCRAPE_UPLOAD_URL: ${{ secrets.JOURNALSCRAPE_UPLOAD_URL }}
+          JOURNALSCRAPE_UPLOAD_TOKEN: ${{ secrets.JOURNALSCRAPE_UPLOAD_TOKEN }}
 
       - uses: actions/upload-artifact@v5
         with:

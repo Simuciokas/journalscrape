@@ -146,7 +146,14 @@ dropped: the library is everything ever scraped, not a snapshot of one walk.
 
 Nobody has everything unlocked, so a scrape is worth more merged with someone else's. When a
 finished run reports its file, an `[upload]` button appears beside it; clicking it POSTs the library
-to whatever collector you have configured. Nothing is ever sent without that click.
+to the collector. Nothing is ever sent without that click.
+
+**A released build ships with a collector already set up**, so this works on a fresh install with
+no configuration - which matters for more than the button: without a collector to ask, a run cannot
+skip the entries someone else has already contributed, and opening all of them is the slow path that
+earns spam kicks. Read [what leaves your machine](#what-leaves-your-machine) before you use it, and
+`upload-url=off` turns it all off. A build from source ships no collector unless you supply one (see
+[building](#building)).
 
 `config/journalscrape.txt` is written on first launch:
 
@@ -159,20 +166,32 @@ max-pause-seconds=15          # ceiling for that growth
 stop-key=none                 # an ADDITIONAL stop key; Escape always works
 max-minutes=0                 # stop on a timer; 0 for no limit
 
-upload-url=https://your-collector.example/api/upload
-upload-token=
-known-url=
+upload-url=                   # blank = the collector this build shipped with; "off" disables
+upload-token=                 # blank = the token this build shipped with
+known-url=                    # blank = derived from upload-url; "off" stops the index check
 ```
 
-Leaving `upload-url` empty disables uploading and the skip-what-is-known check together.
+**Blank means "use what the build shipped with"**, not "disabled" - `upload-url=off` is how you
+disable it. They are left blank rather than filled in so that a collector which changes address or
+rotates its token is fixed by updating the mod, instead of every user editing this file.
+
 `known-url` is derived from `upload-url` (`.../api/upload` -> `.../api/known`) and only needs
 setting if the index lives elsewhere; `known-url=off` keeps uploading but stops the check.
-`upload-token`, if set, is sent as `X-Upload-Token`.
+`upload-token` is sent as `X-Upload-Token`.
+
+The shipped token is **not a secret and is not treated as one** - it is inside every copy of the
+jar and one `strings` command recovers it. It keeps stray traffic off the endpoint, nothing more;
+what actually protects a collector is server-side (rate limiting per address, body and file caps,
+and a merge that cannot delete anything). It is also **paired to the host it was built for**: point
+`upload-url` at a collector of your own and the shipped token is not sent to it, because it is not
+yours to hand over. Set `upload-token` yourself for that case.
 
 ### What leaves your machine
 
 Everything the mod scrapes is written locally under `journalscrape/` and stays there unless you
-send it. Out of the box there is no collector configured, so nothing leaves at all.
+send it - but a released build **does** have a collector configured out of the box, so read this
+section rather than assuming otherwise. One request is made without asking you; the scrape itself
+is never sent without a click.
 
 **When you click `[upload]`**, the mod POSTs the scrape file:
 
@@ -187,15 +206,18 @@ send it. Out of the box there is no collector configured, so nothing leaves at a
 It does not read or send anything else: no account details, no file paths, no other mods, no chat,
 nothing about the rest of your game. Nothing is uploaded without that click.
 
-**One request is not click-gated.** When a collector is configured, each scrape begins by asking it
-what it already holds (see above). That request carries no name and no scrape data - only the token
-if set - but like any web request it reaches the collector from your IP address, and its timing
-tells the operator that you started a scrape. `known-url=off` stops it.
+**One request is not click-gated, and on a released build it happens by default.** Each scrape
+begins by asking the collector what it already holds (see above). That request carries no name and
+no scrape data - only the token - but like any web request it reaches the collector from your IP
+address, and its timing tells the operator that you started a scrape. It defaults to on because the
+alternative is opening every entry, which is slow and gets people kicked; `known-url=off` stops it
+and nothing at all is then sent before you click.
 
-**Where it goes is your choice.** The endpoints are whatever you put in the config; this mod ships
-with none and is not tied to any particular collector. Anything you upload is then in the hands of
-whoever runs it, so it is worth knowing that the reference collector serves the merged result as a
-public web page - your in-game name is not published on it, but the entries you contributed are.
+**Where it goes is your choice, but it has a default.** A released build points at the collector
+behind [faceland.simuciokas.uk](https://faceland.simuciokas.uk); put your own URL in the config to
+send somewhere else, or `off` to send nowhere. Anything you upload is then in the hands of whoever
+runs that collector, so it is worth knowing that this one serves the merged result as a public web
+page - your in-game name is not published on it, but the entries you contributed are.
 
 The two endpoints a collector has to provide:
 
@@ -281,6 +303,22 @@ export JAVA_HOME=/path/to/jdk-25
 
 No local game install needed - the compile classpath is fetched from Mojang's piston metadata and
 sha1-verified, then cached under `build/minecraft/26.2/`.
+
+**Your own collector as the default.** A source build bakes in no collector, so the settings stay
+blank and uploading is off. To ship a build that points at yours, either set
+`JOURNALSCRAPE_UPLOAD_URL` / `JOURNALSCRAPE_UPLOAD_TOKEN` in the environment, or write an untracked
+`collector.properties` beside `build.gradle`:
+
+```
+upload-url=https://your-collector.example/api/upload
+upload-token=your-token
+```
+
+They are read at build time into a resource inside the jar, and the build logs only whether each
+one is set - never the value. `collector.properties` is gitignored, and the release workflow reads
+the same two names from repo secrets: a token in a published jar is public either way, but a jar can
+be replaced by the next release while git history cannot, so keeping it out of the repo is what
+keeps rotating it possible.
 
 ## Status
 

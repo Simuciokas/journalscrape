@@ -8,3 +8,4 @@ run/
 .idea/
 *.iml
 .vscode/
+collector.properties

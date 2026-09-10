@@ -38,7 +38,83 @@ final class Uploader {
 
     private static volatile boolean busy;
 
+    /**
+     * Collector defaults compiled into the jar by the build, or empty in a plain source build.
+     *
+     * <p>WHY THESE EXIST. Without a URL a fresh install has no collector index to consult, so it
+     * opens every entry rather than walking past the ones already collected - the slow path that
+     * earns spam kicks. Defaulting them is what makes the mod useful to someone who just installed
+     * it, rather than only to whoever set the config up by hand.
+     *
+     * <p>The token here is NOT a secret and is not treated as one: it ships in every copy of the
+     * jar and anyone can read it out. It is a spam gate. What actually protects the collector is
+     * server-side - per-address rate limiting, body and file caps, and a merge that cannot be made
+     * to delete anything.
+     */
+    private static final Map<String, String> BAKED = readBaked();
+
     private Uploader() {
+    }
+
+    private static Map<String, String> readBaked() {
+        final Map<String, String> out = new HashMap<>();
+        try (java.io.InputStream in =
+                     Uploader.class.getResourceAsStream("/journalscrape.collector.properties")) {
+            if (in != null) {
+                final java.util.Properties p = new java.util.Properties();
+                p.load(in);
+                for (String k : p.stringPropertyNames()) {
+                    out.put(k.toLowerCase(), p.getProperty(k, "").trim());
+                }
+            }
+        } catch (IOException e) {
+            // A build without the resource is the normal source-build case, not an error.
+        }
+        return out;
+    }
+
+    /**
+     * A URL setting with the baked-in default behind it: the config file wins, blank falls back to
+     * what the build shipped, and "off" means off.
+     *
+     * <p>Blank cannot mean "disabled" any more now that there is something to fall back to, so
+     * there has to be a way to say no explicitly - hence "off", the same word known-url already
+     * used.
+     */
+    private static String urlSetting(Map<String, String> cfg, String key) {
+        final String v = cfg.getOrDefault(key, "").trim();
+        if (v.equalsIgnoreCase("off") || v.equalsIgnoreCase("none")) {
+            return "";
+        }
+        return v.isBlank() ? BAKED.getOrDefault(key, "") : v;
+    }
+
+    /** Host of a URL, lowercased, or "" when it will not parse. */
+    private static String host(String url) {
+        try {
+            final String h = URI.create(url).getHost();
+            return h == null ? "" : h.toLowerCase();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * The token to send with a request to {@code url}.
+     *
+     * <p>THE BAKED TOKEN IS PAIRED TO THE BAKED HOST. Someone who points upload-url at a collector
+     * of their own and leaves the token line blank must not have this build's token sent to their
+     * server - that would hand it to a third party who never had it. An explicitly configured token
+     * is the user's own choice and goes wherever they aimed it.
+     */
+    private static String tokenFor(Map<String, String> cfg, String url) {
+        final String own = cfg.getOrDefault("upload-token", "").trim();
+        if (!own.isBlank()) {
+            return own;
+        }
+        final String bakedHost = host(BAKED.getOrDefault("upload-url", ""));
+        return (!bakedHost.isEmpty() && bakedHost.equals(host(url)))
+                ? BAKED.getOrDefault("upload-token", "") : "";
     }
 
     private static Map<String, String> config() {
@@ -68,9 +144,14 @@ final class Uploader {
         final String text = """
                 # journalscrape - upload settings
                 #
-                # Set both values and an [upload] button appears in chat when a scrape finishes.
-                # Leaving upload-url empty disables uploading entirely; nothing is ever sent
-                # without you clicking that button.
+                # THIS BUILD SHIPS WITH A COLLECTOR ALREADY SET UP. The three settings at the
+                # bottom are blank on purpose: blank means "use the collector this build was
+                # released with", so an [upload] button appears in chat when a scrape finishes
+                # without you configuring anything. Put your own URL there to use a different
+                # collector, or upload-url=off to turn uploading off completely.
+                #
+                # (Leaving them blank rather than filling them in also means a collector whose
+                # address or token changes is fixed by updating the mod, not by editing this file.)
                 #
                 # The collector MERGES what it receives: entries are taken from whoever has read
                 # the most of them, so uploading a partly-unlocked journal cannot overwrite a
@@ -81,12 +162,15 @@ final class Uploader {
                 # name in an X-Player header, so a contribution can be attributed. Nothing is sent
                 # without that click.
                 #
-                # One request is NOT click-gated: before a scrape starts, the collector is asked
-                # what it already holds, so entries nobody can add to are walked past without being
-                # opened - much faster, and far less likely to earn a spam kick. That request sends
-                # no name, only the token if you set one, though it does reach the collector from
-                # your IP address like any web request. Set known-url=off to stop it and always
-                # scrape everything; it is otherwise derived from upload-url.
+                # ONE REQUEST IS NOT CLICK-GATED, AND IT IS ON BY DEFAULT: before a scrape starts,
+                # the collector is asked what it already holds, so entries nobody can add to are
+                # walked past without being opened - much faster, and far less likely to earn a
+                # spam kick, which is why it defaults to on. It sends no name and nothing about
+                # you, but it is a web request, so it reaches the collector from your IP address
+                # like any other. Set known-url=off to stop it and always scrape everything.
+                #
+                # The upload token below is not a secret and is not treated as one - it ships
+                # inside every copy of this mod. It only keeps random traffic off the endpoint.
 
                 # PACING. Reading an entry closes the journal, so the walk re-issues /journal
                 # once per entry; sent flat out that reads as command spam and servers kick for it.
@@ -116,6 +200,7 @@ final class Uploader {
                 stop-key=none
                 max-minutes=0
 
+                # blank = the collector this build shipped with. "off" disables.
                 upload-url=
                 upload-token=
                 known-url=
@@ -143,9 +228,14 @@ final class Uploader {
         if (!explicit.isBlank()) {
             return explicit;
         }
-        final String up = cfg.getOrDefault("upload-url", "");
+        final String up = uploadUrl();
         final int slash = up.lastIndexOf('/');
         return slash > 0 ? up.substring(0, slash) + "/known" : "";
+    }
+
+    /** Where a scrape is sent: the config file, or the collector this build shipped with. */
+    static String uploadUrl() {
+        return urlSetting(config(), "upload-url");
     }
 
     /**
@@ -163,7 +253,7 @@ final class Uploader {
                     .timeout(Duration.ofSeconds(15))
                     .header("Accept", "application/json")
                     .GET();
-            final String token = config().getOrDefault("upload-token", "");
+            final String token = tokenFor(config(), url);
             if (!token.isBlank()) {
                 b.header("X-Upload-Token", token);
             }
@@ -193,8 +283,7 @@ final class Uploader {
     }
 
     static boolean configured() {
-        final String url = config().get("upload-url");
-        return url != null && !url.isBlank();
+        return !uploadUrl().isBlank();
     }
 
     /** Fire-and-forget upload of one scrape file. Safe to call from the client thread. */
@@ -205,10 +294,10 @@ final class Uploader {
             return;
         }
         final Map<String, String> cfg = config();
-        final String url = cfg.getOrDefault("upload-url", "");
+        final String url = urlSetting(cfg, "upload-url");
         if (url.isBlank()) {
-            JournalScrape.say(Component.literal("no upload-url set in config/" + JournalScrape.MOD_ID + ".txt")
-                    .withStyle(ChatFormatting.RED));
+            JournalScrape.say(Component.literal("uploading is off (upload-url in config/"
+                            + JournalScrape.MOD_ID + ".txt)").withStyle(ChatFormatting.RED));
             return;
         }
         if (!Files.isRegularFile(file)) {
@@ -217,7 +306,7 @@ final class Uploader {
             return;
         }
 
-        final String token = cfg.getOrDefault("upload-token", "");
+        final String token = tokenFor(cfg, url);
         final Minecraft mc = Minecraft.getInstance();
         final String player = (mc != null && mc.player != null)
                 ? JournalScrape.plain(mc.player.getName()) : "anon";

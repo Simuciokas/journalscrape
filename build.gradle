@@ -117,7 +117,55 @@ tasks.withType(JavaCompile).configureEach {
     it.options.encoding = 'UTF-8'
 }
 
+// ---- Collector defaults baked into the jar ---------------------------------------------------
+//
+// A fresh installer has nowhere to send a scrape and, worse, no collector index to check - which
+// means walking every entry the hard way, the slow path that earns spam kicks. So a release build
+// bakes the collector's URL and token in as DEFAULTS, and the mod falls back to them when the
+// config leaves those lines blank.
+//
+// SUPPLIED AT BUILD TIME, NEVER COMMITTED: from the environment (CI secrets) or an untracked
+// collector.properties. The token is public the moment a jar ships - anyone can run `strings` on
+// it - so this is not pretending otherwise; the point is that a jar can be replaced by the next
+// release while git history cannot, so keeping it out of the repo keeps rotation possible.
+//
+// Absent both sources the values are blank and the mod behaves exactly as it did before: no
+// uploading, no index check. That is what a plain `git clone && ./gradlew build` produces.
+def collectorProps = new Properties()
+def collectorFile = rootProject.file('collector.properties')
+if (collectorFile.isFile()) {
+    collectorFile.withInputStream { collectorProps.load(it) }
+}
+def collectorUrl = (System.getenv('JOURNALSCRAPE_UPLOAD_URL')
+        ?: collectorProps.getProperty('upload-url', '')).trim()
+def collectorToken = (System.getenv('JOURNALSCRAPE_UPLOAD_TOKEN')
+        ?: collectorProps.getProperty('upload-token', '')).trim()
+def collectorDir = layout.buildDirectory.dir('generated/collector')
+
+tasks.register('bakeCollector') {
+    group = 'build setup'
+    description = 'Writes the collector defaults into a resource that is baked into the jar.'
+    // Declared as inputs so a changed URL or token actually rebuilds the resource. Gradle hashes
+    // these rather than printing them, so the token does not land in a build log or scan report.
+    inputs.property 'url', collectorUrl
+    inputs.property 'token', collectorToken
+    outputs.dir collectorDir
+    doLast {
+        def out = new File(collectorDir.get().asFile, 'journalscrape.collector.properties')
+        out.parentFile.mkdirs()
+        // Written by hand rather than Properties.store, which stamps the file with a timestamp
+        // comment and would make two identical builds produce different jars.
+        out.setText("upload-url=${collectorUrl}\nupload-token=${collectorToken}\n", 'UTF-8')
+        // Presence only - never the values.
+        logger.lifecycle("collector defaults baked: url ${collectorUrl ? 'set' : 'BLANK'}, "
+                + "token ${collectorToken ? 'set' : 'BLANK'}")
+    }
+}
+
+sourceSets.main.resources.srcDir collectorDir
+
 processResources {
+    dependsOn 'bakeCollector'
     inputs.property 'version', project.version
     filesMatching('fabric.mod.json') { expand 'version': project.version }
 }
